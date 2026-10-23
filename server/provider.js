@@ -79,13 +79,21 @@ export function validateModel(body, previous = {}) {
         : "max_tokens",
     inputPrice: price("inputPrice"),
     outputPrice: price("outputPrice"),
+    contextWindow: number("contextWindow", 128000, 4096, 2000000, true),
   };
 }
 
 export async function callModel(
   model,
   messages,
-  { apiKey = "", json = false, maxTokens } = {},
+  {
+    apiKey = "",
+    json = false,
+    maxTokens,
+    native = false,
+    parameters = {},
+    signal,
+  } = {},
 ) {
   if (model.kind === "demo")
     throw new AppError("演示模型不能用于真实调用，请先配置真实模型。");
@@ -96,13 +104,16 @@ export async function callModel(
   };
   if (model.temperature !== null) body.temperature = model.temperature;
   if (json && model.jsonMode) body.response_format = { type: "json_object" };
+  Object.assign(body, parameters);
   const started = performance.now();
   let response;
   try {
     response = await fetch(`${model.baseUrl}/chat/completions`, {
       method: "POST",
       redirect: "error",
-      signal: AbortSignal.timeout(model.timeoutMs),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(model.timeoutMs)])
+        : AbortSignal.timeout(model.timeoutMs),
       headers: {
         "Content-Type": "application/json",
         "X-AI-Gateway-Hop": "1",
@@ -140,10 +151,23 @@ export async function callModel(
   } catch {
     throw new AppError("模型服务返回了无效 JSON。", 502);
   }
-  const content = data.choices?.[0]?.message?.content;
-  if (typeof content !== "string" || !content.trim())
+  const message = data.choices?.[0]?.message;
+  const content = message?.content;
+  const finishReason = data.choices?.[0]?.finish_reason || "stop";
+  const hasToolCalls =
+    Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
+  if (
+    !message ||
+    (typeof content !== "string" && content !== null && content !== undefined)
+  )
+    throw new AppError("模型返回了无效的 assistant 消息。", 502);
+  if (
+    (!native ||
+      (!hasToolCalls && !message.refusal && finishReason !== "length")) &&
+    (typeof content !== "string" || !content.trim())
+  )
     throw new AppError("模型未返回可用文本；可能拒绝请求或输出额度不足。", 502);
-  if (data.choices[0].finish_reason === "length")
+  if (!native && finishReason === "length")
     throw new AppError("模型输出被截断，请提高该模型的输出额度后重试。", 502);
   const prompt = data.usage?.prompt_tokens;
   const completion = data.usage?.completion_tokens;
@@ -160,7 +184,9 @@ export async function callModel(
       ? (prompt * model.inputPrice + completion * model.outputPrice) / 1e6
       : null;
   return {
-    content,
+    content: content || "",
+    message: { ...message, role: "assistant", content: content ?? null },
+    finishReason,
     usage,
     cost,
     latencyMs: Math.round(performance.now() - started),

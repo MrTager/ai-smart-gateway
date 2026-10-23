@@ -7,6 +7,7 @@ import { Store } from "./store.js";
 import { AppError, validateModel, callModel } from "./provider.js";
 import { Engine, validateStrategy } from "./strategy.js";
 import { LIMITS } from "./limits.js";
+import { NativeChatEngine, validateChatRequest } from "./native-chat.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 async function jsonBody(request) {
@@ -51,6 +52,7 @@ export async function createApplication({
 } = {}) {
   const store = await new Store(directory).init();
   const engine = new Engine(store);
+  const nativeEngine = new NativeChatEngine(store, engine.active);
   const server = http.createServer(async (request, response) => {
     response.setHeader("X-Content-Type-Options", "nosniff");
     response.setHeader("X-Frame-Options", "DENY");
@@ -71,7 +73,13 @@ export async function createApplication({
       const route = url.pathname;
       const method = request.method;
       if (route === "/api/health" && method === "GET")
-        return send(response, 200, { status: "ok", localOnly: true });
+        return send(response, 200, {
+          status: "ok",
+          localOnly: true,
+          protocol: "native-agent-v1",
+          functionTools: true,
+          compaction: "client-requested-only",
+        });
       if (route === "/api/config" && method === "GET")
         return send(response, 200, store.publicConfig());
       if (route === "/api/models" && method === "POST") {
@@ -212,67 +220,13 @@ export async function createApplication({
           !safeToken(request.headers.authorization, `Bearer ${gatewayKey}`)
         )
           throw new AppError("网关密钥无效。", 401);
-        const body = await jsonBody(request);
-        if (
-          body.model !== "strategy" ||
-          (body.stream !== undefined && typeof body.stream !== "boolean") ||
-          Object.keys(body).some(
-            (key) =>
-              ![
-                "model",
-                "messages",
-                "stream",
-                "stream_options",
-                "max_tokens",
-                "max_completion_tokens",
-                "temperature",
-              ].includes(key),
-          )
-        )
-          throw new AppError(
-            "当前策略网关仅支持文本请求，不支持 tools、工具结果或其他生成参数。",
-          );
-        const cap = body.max_completion_tokens ?? body.max_tokens;
-        if (
-          cap !== undefined &&
-          (!Number.isInteger(cap) || cap < 1 || cap > 32768)
-        )
-          throw new AppError(
-            "输出 token 限额必须为 1–32768。每个内部调用受此上限及模型配置共同约束。",
-          );
-        if (
-          body.temperature !== undefined &&
-          (typeof body.temperature !== "number" ||
-            body.temperature < 0 ||
-            body.temperature > 2)
-        )
-          throw new AppError("temperature 必须为 0–2。");
-        if (
-          body.stream_options !== undefined &&
-          (!body.stream ||
-            body.stream_options?.include_usage !== true ||
-            Object.keys(body.stream_options).length !== 1)
-        )
-          throw new AppError("stream_options 仅支持 include_usage=true。");
-        if (
-          !Array.isArray(body.messages) ||
-          !body.messages.length ||
-          body.messages.some(
-            (message) =>
-              !["system", "user", "assistant"].includes(message.role) ||
-              typeof message.content !== "string",
-          )
-        )
-          throw new AppError(
-            "messages 仅支持 system/user/assistant 的纯文本内容。",
-          );
-        const task = body.messages
-          .map((message) => `[${message.role}]\n${message.content}`)
-          .join("\n\n");
-        const run = engine.create(task, false, {
-          maxTokens: cap,
-          temperature: body.temperature,
+        const body = validateChatRequest(await jsonBody(request));
+        const controller = new AbortController();
+        request.once("aborted", () => controller.abort());
+        response.once("close", () => {
+          if (!response.writableEnded) controller.abort();
         });
+        const { run, job } = nativeEngine.create(body, controller.signal);
         let heartbeat;
         if (body.stream) {
           response.writeHead(200, {
@@ -281,15 +235,20 @@ export async function createApplication({
             Connection: "keep-alive",
             "X-Accel-Buffering": "no",
           });
-          response.write(": strategy-planning\n\n");
+          response.write(": gateway-working\n\n");
           heartbeat = setInterval(() => {
-            if (!response.destroyed) response.write(": strategy-working\n\n");
+            if (!response.destroyed) response.write(": gateway-working\n\n");
           }, 10000);
           response.once("close", () => clearInterval(heartbeat));
         }
-        await engine.active.get(run.id);
-        clearInterval(heartbeat);
-        if (run.status !== "completed") {
+        let result;
+        try {
+          result = await job;
+        } finally {
+          clearInterval(heartbeat);
+        }
+        if (response.destroyed) return;
+        if (!result) {
           if (body.stream) {
             response.write(
               `data: ${JSON.stringify({ error: { message: run.error, type: "gateway_error" } })}\n\n`,
@@ -314,8 +273,8 @@ export async function createApplication({
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: run.result },
-              finish_reason: "stop",
+              message: result.message,
+              finish_reason: result.finishReason,
             },
           ],
           usage,
@@ -323,15 +282,26 @@ export async function createApplication({
         };
         if (body.stream) {
           const { id, created, model } = completion;
-          const chunk = (delta, finish_reason = null, extra = {}) =>
+          const chunk = (delta, finish_reason = null) =>
             response.write(
-              `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`,
+              `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason }] })}\n\n`,
             );
           chunk({ role: "assistant", content: "" });
-          const characters = Array.from(run.result);
+          if (result.message.reasoning_content)
+            chunk({ reasoning_content: result.message.reasoning_content });
+          if (result.message.refusal)
+            chunk({ refusal: result.message.refusal });
+          const characters = Array.from(result.message.content || "");
           for (let offset = 0; offset < characters.length; offset += 128)
             chunk({ content: characters.slice(offset, offset + 128).join("") });
-          chunk({}, "stop");
+          if (result.message.tool_calls?.length)
+            chunk({
+              tool_calls: result.message.tool_calls.map((call, index) => ({
+                index,
+                ...call,
+              })),
+            });
+          chunk({}, result.finishReason);
           if (body.stream_options?.include_usage)
             response.write(
               `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage })}\n\n`,
@@ -366,7 +336,7 @@ export async function createApplication({
   });
   server.requestTimeout = 30000;
   server.headersTimeout = 10000;
-  return { server, store, engine };
+  return { server, store, engine, nativeEngine };
 }
 
 if (

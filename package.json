@@ -1,6 +1,6 @@
 {
   "name": "ai-smart-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "AI智能网关：可配置的决策模型与执行模型编排控制台",
   "type": "module",
@@ -11,7 +11,10 @@
     "dev": "node --watch server/index.js",
     "start": "node server/index.js",
     "test": "node --test tests/*.test.js",
-    "check": "node --check server/index.js && node --check server/strategy.js && node --check public/app.js"
+    "check": "node --check server/index.js && node --check server/strategy.js && node --check server/native-chat.js && node --check public/app.js && node --check scripts/connect-opencodex.mjs && node --check scripts/smoke-native.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "js-tiktoken": "1.0.21"
+  }
 }

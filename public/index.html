@@ -48,7 +48,7 @@
       </div>
       <div class="sidebar-footer">
         <span class="connection-dot"></span>本地服务<span class="version"
-          >v0.1.0</span
+          >v0.2.0</span
         >
       </div>
     </aside>
@@ -130,6 +130,16 @@
               autocomplete="new-password"
               placeholder="留空保留已有密钥"
             /><small>更换地址后需重新输入密钥。</small></label
+          >
+          <label
+            >上下文窗口（token）<input
+              name="contextWindow"
+              type="number"
+              min="4096"
+              max="2000000"
+              value="128000"
+              required
+            /><small>按上游实际容量配置，不会赋予模型额外能力。</small></label
           >
           <label
             >最大输出 token<input

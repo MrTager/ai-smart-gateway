@@ -10,6 +10,7 @@ import { Store } from "../server/store.js";
 import { parsePlan, validateStrategy } from "../server/strategy.js";
 import { validateModel } from "../server/provider.js";
 import { LIMITS } from "../server/limits.js";
+import { COMPACTION_MARKER } from "../server/native-chat.js";
 
 async function fixture(t, gatewayKey = "") {
   const directory = await mkdtemp(path.join(tmpdir(), "ai-gateway-test-"));
@@ -322,7 +323,7 @@ test("OpenAI-shaped gateway returns final result and total multi-call usage", as
   assert.equal(status, 200);
   assert.equal(body.object, "chat.completion");
   assert.match(body.choices[0].message.content, /delivered/);
-  assert.equal(body.usage.total_tokens, 90);
+  assert.equal(body.usage.total_tokens, 60);
   assert(body.gateway_trace_id);
 });
 test("referenced model cannot be deleted and unknown API is 404", async (t) => {
@@ -364,7 +365,11 @@ test("restart marks interrupted jobs as failed without re-execution", async (t) 
 
 test("gateway rejects unsupported parameters instead of silently ignoring them", async (t) => {
   const app = await fixture(t);
-  for (const extra of [{ top_p: 0.5 }, { max_tokens: 0 }, { tools: [] }]) {
+  for (const extra of [
+    { logit_bias: {} },
+    { max_tokens: 0 },
+    { tools: [{ type: "web_search" }] },
+  ]) {
     const result = await app.request("/v1/chat/completions", "POST", {
       model: "strategy",
       messages: [{ role: "user", content: "hello" }],
@@ -406,7 +411,7 @@ test("SSE gateway returns final text, usage, DONE and honors per-call cap", asyn
     .split("\n")
     .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
     .map((line) => JSON.parse(line.slice(6)));
-  assert(events.some((event) => event.usage?.total_tokens === 90));
+  assert(events.some((event) => event.usage?.total_tokens === 60));
   assert.equal(
     events
       .flatMap((event) => event.choices)
@@ -449,11 +454,12 @@ test("large multi-megabyte input reaches planner intact without flooding history
     ...config.body.strategy,
     review: false,
   });
-  const response = await app.request("/v1/chat/completions", "POST", {
-    model: "strategy",
-    messages: [{ role: "user", content: text }],
+  const response = await app.request("/api/runs", "POST", {
+    task: "[user]\n" + text,
+    demo: false,
   });
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 202);
+  await app.engine.active.get(response.body.id);
   assert(plannerSawSource);
   const history = await app.request("/api/runs");
   assert(history.body[0].task.length <= 360);
@@ -472,4 +478,465 @@ test("task transport guard rejects huge Unicode input by bytes, not by token cla
   const text = "中".repeat(Math.floor(LIMITS.maxTaskBytes / 3) + 1);
   assert.throws(() => app.engine.create(text, true), /16 MiB/);
   assert.equal(app.store.state.runs.length, 0);
+});
+
+const weatherTools = [
+  {
+    type: "function",
+    function: {
+      name: "get_weather",
+      description: "查询指定地点的天气",
+      parameters: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"],
+      },
+    },
+  },
+];
+async function noReview(app) {
+  const config = (await app.request("/api/config")).body;
+  await app.request("/api/strategy", "PUT", {
+    ...config.strategy,
+    review: false,
+  });
+}
+function toolCompletion(res, calls, content = null) {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(
+    JSON.stringify({
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content,
+            tool_calls: calls,
+            reasoning_content: "opaque-provider-state",
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    }),
+  );
+}
+
+test("weather query preserves tools and system messages across a complete tool loop without planning or compaction", async (t) => {
+  const app = await fixture(t);
+  const messages = [
+    { role: "system", content: "Only use tool results for current weather." },
+    { role: "developer", content: "Do not invent observations." },
+    { role: "user", content: "帮我查询今天杭州的天气" },
+  ];
+  const call = {
+    id: "call-weather-1",
+    type: "function",
+    function: { name: "get_weather", arguments: '{"city":"杭州"}' },
+  };
+  let count = 0;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    assert.deepEqual(body.tools, weatherTools);
+    assert.equal(body.parallel_tool_calls, false);
+    assert(
+      !body.messages.some((message) =>
+        String(message.content).includes(COMPACTION_MARKER),
+      ),
+    );
+    if (count === 1) {
+      assert.deepEqual(body.messages, messages);
+      return toolCompletion(res, [call]);
+    }
+    assert.equal(body.messages.at(-1).tool_call_id, call.id);
+    assert.equal(
+      body.messages.at(-2).reasoning_content,
+      "opaque-provider-state",
+    );
+    assert.equal(body.messages.at(-1).content, "WEATHER_FIXTURE_VERIFIED");
+    completion(res, "WEATHER_FIXTURE_VERIFIED");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const first = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages,
+    tools: weatherTools,
+    tool_choice: "auto",
+    parallel_tool_calls: false,
+    top_p: 0.9,
+  });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.choices[0].finish_reason, "tool_calls");
+  assert.deepEqual(first.body.choices[0].message.tool_calls, [call]);
+  const second = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages: [
+      ...messages,
+      first.body.choices[0].message,
+      {
+        role: "tool",
+        tool_call_id: call.id,
+        content: "WEATHER_FIXTURE_VERIFIED",
+      },
+    ],
+    tools: weatherTools,
+    parallel_tool_calls: false,
+  });
+  assert.equal(second.status, 200);
+  assert.equal(
+    second.body.choices[0].message.content,
+    "WEATHER_FIXTURE_VERIFIED",
+  );
+  assert.equal(count, 2);
+  assert(
+    app.store.state.runs.every(
+      (run) => run.calls.length === 1 && run.calls[0].role === "executor",
+    ),
+  );
+  assert(
+    !JSON.stringify(app.store.state.runs).includes("opaque-provider-state"),
+  );
+});
+
+test("SSE carries tool call IDs, JSON arguments, tool_calls finish reason and usage", async (t) => {
+  const app = await fixture(t);
+  const call = {
+    id: "stream-weather",
+    type: "function",
+    function: { name: "get_weather", arguments: '{"city":"杭州"}' },
+  };
+  const baseUrl = await provider(t, (_body, _req, res) =>
+    toolCompletion(res, [call]),
+  );
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const response = await fetch(app.url + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "strategy",
+      messages: [{ role: "user", content: "杭州天气" }],
+      tools: weatherTools,
+      stream: true,
+      stream_options: { include_usage: true },
+    }),
+  });
+  const raw = await response.text();
+  const events = raw
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)));
+  assert.equal(response.status, 200);
+  const delta = events
+    .flatMap((event) => event.choices || [])
+    .find((choice) => choice.delta.tool_calls)?.delta.tool_calls[0];
+  assert.deepEqual(delta, { index: 0, ...call });
+  assert(
+    events.some((event) =>
+      event.choices?.some((choice) => choice.finish_reason === "tool_calls"),
+    ),
+  );
+  assert(events.some((event) => event.usage?.total_tokens === 15));
+});
+
+test("explicit client compaction is a single unchanged summarizer call, not a planning workflow", async (t) => {
+  const app = await fixture(t);
+  const messages = [
+    { role: "system", content: "Retain exact task constraints." },
+    { role: "user", content: "历史信息" },
+    { role: "assistant", content: "当前进度" },
+    { role: "user", content: COMPACTION_MARKER + " Create a handoff summary." },
+  ];
+  let count = 0;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    assert.deepEqual(body.messages, messages);
+    completion(res, "Preserved context summary.");
+  });
+  await addLive(app, baseUrl);
+  const result = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(
+    result.body.choices[0].message.content,
+    "Preserved context summary.",
+  );
+  assert.equal(count, 1);
+  assert.equal(app.store.state.runs[0].mode, "client-compaction");
+  assert.equal(app.store.state.runs[0].calls[0].role, "compaction");
+});
+
+test("parallel tool results may arrive in a different order and retain their matching IDs", async (t) => {
+  const app = await fixture(t);
+  const calls = ["a", "b"].map((id) => ({
+    id,
+    type: "function",
+    function: { name: "get_weather", arguments: JSON.stringify({ city: id }) },
+  }));
+  let count = 0;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    if (count === 1) return toolCompletion(res, calls);
+    assert.equal(body.messages.at(-2).tool_call_id, "b");
+    assert.equal(body.messages.at(-1).tool_call_id, "a");
+    completion(res, "parallel completed");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const messages = [{ role: "user", content: "查询天气" }];
+  const first = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages,
+    tools: weatherTools,
+    parallel_tool_calls: true,
+  });
+  const second = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    tools: weatherTools,
+    messages: [
+      ...messages,
+      first.body.choices[0].message,
+      { role: "tool", tool_call_id: "b", content: "b result" },
+      { role: "tool", tool_call_id: "a", content: "a result" },
+    ],
+  });
+  assert.equal(second.status, 200);
+  assert.equal(second.body.choices[0].message.content, "parallel completed");
+});
+
+test("orphaned tool output is rejected before any inference", async (t) => {
+  const app = await fixture(t);
+  const result = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages: [{ role: "tool", tool_call_id: "missing", content: "x" }],
+  });
+  assert.equal(result.status, 400);
+  assert.equal(app.store.state.runs.length, 0);
+});
+
+test("long native turns use the larger-context model without truncating original messages", async (t) => {
+  const app = await fixture(t);
+  const messages = [{ role: "user", content: "word ".repeat(4000) }];
+  const baseUrl = await provider(t, (body, _req, res) => {
+    assert.equal(body.model, "large-context");
+    assert.deepEqual(body.messages, messages);
+    completion(res, "large context preserved");
+  });
+  const fast = await addLive(app, baseUrl, {
+    model: "small-context",
+    contextWindow: 4096,
+  });
+  const result = await app.request("/api/models", "POST", {
+    name: "Large planner",
+    kind: "live",
+    model: "large-context",
+    contextWindow: 128000,
+    baseUrl,
+  });
+  const large = result.body.models.at(-1);
+  await app.request("/api/strategy", "PUT", {
+    ...result.body.strategy,
+    plannerId: large.id,
+    executorIds: [fast.id],
+    review: false,
+  });
+  const answer = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages,
+  });
+  assert.equal(answer.status, 200);
+  assert.equal(app.store.state.runs[0].routeReason, "large-context-escalation");
+});
+
+test("complex native tasks plan routing then retain the original conversation for execution", async (t) => {
+  const app = await fixture(t);
+  const messages = [
+    { role: "system", content: "Original permissions and constraints." },
+    {
+      role: "user",
+      content:
+        "Design a complete migration plan for a complicated distributed system with multiple components and validation stages.",
+    },
+  ];
+  let count = 0;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    if (count === 1)
+      return completion(
+        res,
+        '{"executorIndex":0,"plan":"Verify assumptions then produce a staged migration."}',
+      );
+    assert.deepEqual(body.messages.slice(1), messages);
+    completion(res, "migration plan");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const result = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(count, 2);
+  assert.deepEqual(
+    app.store.state.runs[0].calls.map((call) => call.role),
+    ["planner", "executor"],
+  );
+});
+
+test("an old compaction marker in history does not compact a new weather question", async (t) => {
+  const app = await fixture(t);
+  const messages = [
+    { role: "user", content: COMPACTION_MARKER },
+    { role: "assistant", content: "Old summary." },
+    { role: "user", content: "杭州天气" },
+  ];
+  const baseUrl = await provider(t, (body, _req, res) => {
+    assert.deepEqual(body.messages, messages);
+    completion(res, "Need a live weather tool.");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const answer = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages,
+  });
+  assert.equal(answer.status, 200);
+  assert.equal(app.store.state.runs[0].routeReason, "simple-task-direct");
+  assert.deepEqual(
+    app.store.state.runs[0].calls.map((call) => call.role),
+    ["executor"],
+  );
+});
+
+test("native output truncation retains finish_reason=length instead of becoming a fake context failure", async (t) => {
+  const app = await fixture(t);
+  const baseUrl = await provider(t, (_body, _req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        choices: [
+          {
+            message: { role: "assistant", content: "partial" },
+            finish_reason: "length",
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 10 },
+      }),
+    );
+  });
+  await addLive(app, baseUrl);
+  const answer = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages: [{ role: "user", content: "hello" }],
+  });
+  assert.equal(answer.status, 200);
+  assert.equal(answer.body.choices[0].finish_reason, "length");
+  assert.equal(answer.body.choices[0].message.content, "partial");
+});
+
+test("client cancellation aborts the native inference instead of leaving an active model call", async (t) => {
+  const app = await fixture(t);
+  let ready;
+  const started = new Promise((resolve) => {
+    ready = resolve;
+  });
+  const baseUrl = await provider(t, async (_body, _req, res) => {
+    ready();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (!res.destroyed) completion(res, "late result");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const controller = new AbortController();
+  const request = fetch(app.url + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "strategy",
+      messages: [{ role: "user", content: "hello" }],
+    }),
+    signal: controller.signal,
+  });
+  const rejected = assert.rejects(request);
+  await started;
+  controller.abort();
+  await rejected;
+  await Promise.all([...app.engine.active.values()]);
+  assert.equal(app.engine.active.size, 0);
+  assert.equal(app.store.state.runs[0].status, "failed");
+  assert.match(app.store.state.runs[0].error, /取消/);
+});
+
+test("large native conversations exercise the tokenizer estimate without truncation", async (t) => {
+  const app = await fixture(t);
+  const messages = [{ role: "user", content: "word ".repeat(20000) }];
+  let count = 0;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    if (count === 1) return completion(res, '{"executorIndex":0}');
+    assert.deepEqual(body.messages, messages);
+    completion(res, "full input received");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const answer = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages,
+  });
+  assert.equal(answer.status, 200);
+  assert.equal(
+    app.store.state.runs[0].inputEstimate.method,
+    "o200k_base-estimate",
+  );
+  assert(app.store.state.runs[0].inputEstimate.tokens < 100000);
+});
+
+test("tool continuations stay on the producing model when the executor pool order changes", async (t) => {
+  const app = await fixture(t);
+  const call = {
+    id: "stable-route",
+    type: "function",
+    function: { name: "get_weather", arguments: '{"city":"杭州"}' },
+  };
+  let count = 0;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    assert.equal(body.model, "first-model");
+    if (count === 1) return toolCompletion(res, [call]);
+    completion(res, "continued on same model");
+  });
+  const firstModel = await addLive(app, baseUrl, { model: "first-model" });
+  const added = await app.request("/api/models", "POST", {
+    name: "Other executor",
+    model: "second-model",
+    kind: "live",
+    baseUrl,
+  });
+  const secondModel = added.body.models.at(-1);
+  await noReview(app);
+  const messages = [{ role: "user", content: "杭州天气" }];
+  const first = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages,
+    tools: weatherTools,
+  });
+  const config = (await app.request("/api/config")).body;
+  await app.request("/api/strategy", "PUT", {
+    ...config.strategy,
+    executorIds: [secondModel.id, firstModel.id],
+  });
+  const answer = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    tools: weatherTools,
+    messages: [
+      ...messages,
+      first.body.choices[0].message,
+      { role: "tool", tool_call_id: call.id, content: "test result" },
+    ],
+  });
+  assert.equal(answer.status, 200);
+  assert.equal(count, 2);
+  assert.equal(app.store.state.runs[0].executionModelId, firstModel.id);
 });

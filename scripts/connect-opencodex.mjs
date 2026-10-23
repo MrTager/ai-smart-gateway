@@ -21,6 +21,14 @@ export function contextMetadata() {
   };
 }
 
+export function agentMetadata() {
+  return {
+    modelDisplayNames: { strategy: "AI智能网关·策略模型" },
+    preserveReasoningContentModels: ["strategy"],
+    note: "原生文本与函数工具协议；工具由 Codex 客户端执行。简单任务直达执行模型，复杂任务由决策模型规划路由。仅响应客户端显式压缩。",
+  };
+}
+
 export function routedModels(rows) {
   return [
     ...new Set(
@@ -35,6 +43,16 @@ export function routedModels(rows) {
         .map((id) => (id.includes("/") ? id : `openai/${id}`)),
     ),
   ];
+}
+
+export function catalogContextWindow(slug, rows) {
+  const baseSlug = slug.replace(/--fast$/, "");
+  const row =
+    rows.find((row) => row.slug === slug) ||
+    rows.find((row) => row.slug === baseSlug) ||
+    (baseSlug.startsWith("openai/") &&
+      rows.find((row) => row.slug === baseSlug.slice("openai/".length)));
+  return Number.isInteger(row?.context_window) ? row.context_window : undefined;
 }
 
 async function request(base, route, key, method = "GET", body) {
@@ -108,10 +126,38 @@ export async function connect() {
   const bySlug = new Map(
     gatewayConfig.models.map((model) => [model.model, model]),
   );
+  const contextWindows = new Map();
+  try {
+    const catalog = JSON.parse(
+      await readFile(
+        path.join(
+          process.env.CODEX_HOME || path.join(homedir(), ".codex"),
+          "opencodex-catalog.json",
+        ),
+        "utf8",
+      ),
+    );
+    for (const slug of models) {
+      const window = catalogContextWindow(slug, catalog.models || []);
+      if (window) contextWindows.set(slug, window);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
   for (const slug of models) {
     const previous = bySlug.get(slug);
     // Do not rewrite user-edited model configurations on subsequent runs.
-    if (previous) continue;
+    if (previous) {
+      if (!previous.contextWindow && contextWindows.has(slug))
+        await request(
+          gatewayUrl,
+          `/api/models/${previous.id}`,
+          gatewayKey,
+          "PUT",
+          { ...previous, contextWindow: contextWindows.get(slug), apiKey: "" },
+        );
+      continue;
+    }
     const result = await request(
       gatewayUrl,
       "/api/models",
@@ -130,6 +176,7 @@ export async function connect() {
         jsonMode: false,
         inputPrice: null,
         outputPrice: null,
+        contextWindow: contextWindows.get(slug) || 128000,
       },
     );
     bySlug.set(
@@ -185,20 +232,30 @@ export async function connect() {
         noVisionModels: ["strategy"],
         noTemperatureModels: ["strategy"],
         noTopPModels: ["strategy"],
-        modelDisplayNames: { strategy: "AI智能网关·文本策略" },
-        note: "本地策略编排：文本任务专用；不支持 tools、工具结果或多模态。内部上游必须为其他明确渠道模型，禁止回指自身。",
+        ...agentMetadata(),
       },
     });
   }
   if (existing) {
+    const { modelDisplayNames, ...metadata } = agentMetadata();
     await request(
       ocxUrl,
       `/api/providers?name=${providerName}`,
       adminKey,
       "PATCH",
-      contextMetadata(),
+      { ...contextMetadata(), ...metadata },
     );
   }
+  await request(
+    ocxUrl,
+    `/api/providers/${providerName}/model-display-names`,
+    adminKey,
+    "PUT",
+    {
+      modelId: "strategy",
+      displayName: agentMetadata().modelDisplayNames.strategy,
+    },
+  );
   await request(ocxUrl, "/api/provider-context-caps", adminKey, "PUT", {
     provider: providerName,
     enabled: true,
@@ -212,11 +269,16 @@ export async function connect() {
   const visible = (await request(ocxUrl, "/v1/models", upstreamKey)).data?.some(
     (model) => model.id === `${providerName}/strategy`,
   );
+  const activeConfig = await request(gatewayUrl, "/api/config", gatewayKey);
   console.log(
     JSON.stringify({
       importedModels: models.length,
-      planner: planner.model,
-      executors: executors.map((model) => model.model),
+      planner: activeConfig.models.find(
+        (model) => model.id === activeConfig.strategy.plannerId,
+      )?.model,
+      executors: activeConfig.strategy.executorIds.map(
+        (id) => activeConfig.models.find((model) => model.id === id)?.model,
+      ),
       provider: providerName,
       visible,
       defaultsPreserved: true,

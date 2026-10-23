@@ -254,6 +254,7 @@ function showModel(model = {}) {
     "baseUrl",
     "kind",
     "maxTokens",
+    "contextWindow",
     "tokenParameter",
     "inputPrice",
     "outputPrice",
