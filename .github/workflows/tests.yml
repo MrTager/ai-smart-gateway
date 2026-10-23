@@ -15,3 +15,15 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm run check
       - run: npm test
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node scripts/connect-opencodex.mjs --prepare
+      - run: docker compose up -d --build --wait
+      - run: curl --fail http://127.0.0.1:4317/api/health
+      - if: always()
+        run: docker compose down

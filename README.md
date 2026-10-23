@@ -18,6 +18,45 @@ npm start
 开发时可运行 `npm run dev`。自定义端口用 `PORT=4400 npm start`。
 初始三个模型是明确标注的演示配置：可直接运行演示任务，但没有真实智能生成和外部 API 调用。
 
+## 本地 Docker + OpenCodex 双向接入
+
+先确认 Docker Desktop 和本机 OpenCodex 已启动。以下流程读取当前用户的 OpenCodex 运行端口，
+不更改其默认渠道，也不会输出密钥：
+
+```sh
+node scripts/connect-opencodex.mjs --prepare
+docker compose up -d --build --wait
+node scripts/connect-opencodex.mjs
+```
+
+- 控制台和网关：`http://127.0.0.1:4317`；网关 Base URL 为 `http://127.0.0.1:4317/v1`。
+- Docker 使用非 root 用户、只读根文件系统、healthcheck、自动重启及持久命名卷。
+  仅将端口发布到宿主机 `127.0.0.1`，不要改成公网映射；容器内监听 `0.0.0.0` 是 Docker 转发所需。
+- 容器通过 `host.docker.internal:<OpenCodex端口>/v1` 调用宿主机 OpenCodex。
+  OpenCodex 主监听器需要允许 Docker 访问（不能只监听宿主机的 127.0.0.1）。脚本不擅自修改其监听范围。
+- 首次接入会导入可见模型（原生别名规范为 `openai/...`，去重后排除本网关），
+  创建专用数据面 key，并默认选择已发现的 GPT 决策模型与快速执行模型。
+  后续运行不会重写已导入模型的用户配置，也不会重置已配置策略。
+- OpenCodex 新增 `ai-smart-gateway/strategy`，显示为“AI智能网关·文本策略”。
+  接入通过 OpenCodex 管理 API 完成，变更前备份其配置，不重启正在使用的服务。
+- 路径：`OpenCodex → ai-smart-gateway/strategy → Docker网关 → OpenCodex的明确上游模型`。
+  网关禁止把 `strategy` 或 `ai-smart-gateway/*` 配为上游，并拒绝带循环标记的入站请求。
+- **该入口仍为文本编排，不支持工具声明、工具结果或多模态。不能作为完整 Codex 编码/工具代理使用。**
+  不支持的请求明确报错，不会忽略工具或声称完成实际文件操作。
+- `.local/gateway-api-key` 是 Docker secret 的本机源文件，父目录权限为 0700，文件可供
+  容器非 root 用户读取；该目录被 Git 和 Docker build 忽略。不要删除此文件后直接重建，
+  否则已保存的 OpenCodex 下游认证 key 会失配。需要轮换时应同步更新两端。
+- Docker 数据位于 `ai-smart-gateway_gateway-data` 卷，和原来的宿主机 `.data` 目录分别保存，
+  原目录不删除。停止使用请执行 `docker compose stop`；不要使用 `down -v`，除非确定要删除运行数据。
+- 若要回滚接入，在 OpenCodex 删除新增 provider，并撤销专用 key；不要直接用全量备份覆盖
+  之后的其他配置更改。备份位于 OpenCodex home 的 `backups/ai-smart-gateway-*.json`。
+
+桌面服务的控制台可从“模型配置”调整已导入模型，从“策略编排”切换决策/执行角色。
+当前最多保存 100 个模型；导入并不等于逐个验证模型额度与可用性。
+
+OpenCodex 同时看得到网关的汇总调用和网关发起的内部模型调用。做 token/费用对照时请只统计
+实际上游，排除 `ai-smart-gateway` 汇总记录，避免把同一批 token 重复累计。
+
 ## 配置真实模型
 
 1. 进入“模型配置”，添加模型显示名称、模型 ID、API Base URL 和 API Key。
@@ -30,7 +69,7 @@ npm start
 5. 返回总览，输入任务，**取消“演示运行”**，发起真实调用。真实调用会产生服务商费用。
 
 兼容目标为文本 Chat Completions API，并非所有厂商接口的全兼容适配器。
-目前不支持 Responses API、Anthropic 原生接口、多模态、流式、工具调用或自定义 HTTP 头。
+目前不直接支持 Responses API、Anthropic 原生接口、多模态、工具调用或自定义 HTTP 头。
 可连接采用兼容协议的本机模型服务；非本机 API 要求 HTTPS，不跟随重定向。
 
 ## 策略执行逻辑
@@ -51,7 +90,7 @@ npm start
 ## 本地网关接口
 
 `GET /v1/models` 返回虚拟模型 `strategy`。
-`POST /v1/chat/completions` 支持非流式的 system/user/assistant 纯文本消息：
+`POST /v1/chat/completions` 支持 system/user/assistant 纯文本消息及可选 SSE：
 
 ```sh
 curl http://127.0.0.1:4317/v1/chat/completions \
@@ -62,7 +101,14 @@ curl http://127.0.0.1:4317/v1/chat/completions \
 必须先完成真实模型与策略配置。网关接口始终真实调用，不接受演示参数。
 输出 `usage` 是整次规划、执行、复核的累计服务商用量，而不是最后一次调用的用量。
 任一调用缺少 usage 时，累计 usage 为 `null`，不编造数值。`gateway_trace_id` 可对应控制台执行记录。
-每个模型的输出参数在面板设置；不支持的外部参数会被拒绝，避免悄悄忽略。
+默认采用面板输出参数。请求可传 `max_tokens` 或 `max_completion_tokens`（1–32768），
+作为**每次内部调用**的额外上限，与该模型配置取较小值；不是整次编排的硬预算。
+`temperature` 可覆盖当前任务的内部调用温度。其他不支持的参数会明确被拒绝。
+
+`stream:true` 使用 SSE：规划/执行期间发送注释保活，整个任务完成后分块发送最终文本，
+以 `[DONE]` 结束；这不是模型逐 token 透传。`stream_options:{"include_usage":true}` 可获取
+累计用量事件。OpenCodex 可将这个 Chat Completions 入口桥接给其文本 Responses 客户端。
+工具调用仍不支持，不会因为协议桥接而获得工具执行能力。
 
 可通过环境变量 `GATEWAY_API_KEY` 为 `/v1/*` 设置 Bearer 访问密钥：
 
@@ -88,7 +134,8 @@ node --env-file=.env server/index.js
 
 ## 安全与数据边界
 
-- 仅监听 `127.0.0.1`，限制 Host 与跨站请求。**控制台没有多用户认证，不要直接暴露到公网或反向代理。**
+- 默认原生监听 `127.0.0.1`；Docker 内可用 `HOST=0.0.0.0`，但必须提供网关 key 并仅发布宿主机回环端口。
+  限制 Host 与跨站请求。**控制台没有多用户认证，不要直接暴露到公网或反向代理。**
 - 模型密钥通过 AES-256-GCM 加密保存在 `.data/state.json`，主密钥在 `.data/secret.key`。
   目录权限 0700、文件权限 0600。前端不接收明文或密文密钥，更换 API 地址会清除旧密钥，避免误发。
 - 主密钥与数据都在同一设备；加密不是对当前系统账号、管理员或磁盘被完整窃取的保护。
@@ -112,7 +159,7 @@ npm test
 ## 后续方向
 
 - 单模型基线对照、总费用预算与质量评价。
-- 流式事件、取消、失败重试预算与可选升级到高能力模型。
+- 逐 token 流式、取消、失败重试预算与可选升级到高能力模型。
 - 多协议适配、模型能力标签与按任务类型选择执行模型。
 - 生产认证、独立密钥管理与数据库。
 

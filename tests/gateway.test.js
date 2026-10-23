@@ -354,7 +354,9 @@ test("restart marks interrupted jobs as failed without re-execution", async (t) 
   app.store.state.runs.push({ id: "interrupted", status: "running" });
   await app.store.save();
   const restarted = await new Store(app.directory).init();
-  const interrupted = restarted.state.runs.find((run) => run.id === "interrupted");
+  const interrupted = restarted.state.runs.find(
+    (run) => run.id === "interrupted",
+  );
   assert.equal(interrupted.status, "failed");
   assert(interrupted.finishedAt);
 });
@@ -369,5 +371,58 @@ test("gateway rejects unsupported parameters instead of silently ignoring them",
     });
     assert.equal(result.status, 400);
   }
+  assert.equal(app.store.state.runs.length, 0);
+});
+
+test("SSE gateway returns final text, usage, DONE and honors per-call cap", async (t) => {
+  const app = await fixture(t);
+  const baseUrl = await provider(t, (body, _req, res) => {
+    assert.equal(body.max_tokens, 128);
+    completion(
+      res,
+      body.messages[0].content.includes("任务规划器")
+        ? '{"steps":[{"title":"A","instruction":"work"}]}'
+        : "streamed result 😀",
+    );
+  });
+  await addLive(app, baseUrl);
+  const response = await fetch(app.url + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "strategy",
+      messages: [{ role: "user", content: "hello" }],
+      stream: true,
+      stream_options: { include_usage: true },
+      max_tokens: 128,
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /event-stream/);
+  const content = await response.text();
+  assert(content.includes("data: [DONE]"));
+  const events = content
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map((line) => JSON.parse(line.slice(6)));
+  assert(events.some((event) => event.usage?.total_tokens === 90));
+  assert.equal(
+    events
+      .flatMap((event) => event.choices)
+      .map((choice) => choice.delta.content || "")
+      .join(""),
+    "streamed result 😀",
+  );
+});
+
+test("recursive gateway header is rejected before any model is called", async (t) => {
+  const app = await fixture(t);
+  const response = await app.request(
+    "/v1/chat/completions",
+    "POST",
+    { model: "strategy", messages: [{ role: "user", content: "x" }] },
+    { "X-AI-Gateway-Hop": "1" },
+  );
+  assert.equal(response.status, 508);
   assert.equal(app.store.state.runs.length, 0);
 });

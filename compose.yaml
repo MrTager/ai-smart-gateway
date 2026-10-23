@@ -1,0 +1,30 @@
+name: ai-smart-gateway
+services:
+  gateway:
+    build: .
+    image: ai-smart-gateway:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4317:4317"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "4317"
+      GATEWAY_API_KEY_FILE: /run/secrets/gateway_api_key
+    secrets:
+      - gateway_api_key
+    volumes:
+      - gateway-data:/app/.data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+secrets:
+  gateway_api_key:
+    file: ./.local/gateway-api-key
+volumes:
+  gateway-data:

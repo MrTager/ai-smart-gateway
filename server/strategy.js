@@ -142,12 +142,18 @@ export class Engine {
     this.store = store;
     this.active = new Map();
   }
-  create(task, demo = true) {
+  create(task, demo = true, overrides = {}) {
     if (typeof task !== "string" || !task.trim() || task.length > 24000)
       throw new AppError("任务不能为空，且不能超过 24,000 字符。");
     if (this.active.size >= 4)
       throw new AppError("最多同时运行 4 个任务，请稍后重试。", 429);
     const config = structuredClone(this.store.state);
+    for (const model of config.models) {
+      if (overrides.maxTokens !== undefined)
+        model.maxTokens = Math.min(model.maxTokens, overrides.maxTokens);
+      if (overrides.temperature !== undefined)
+        model.temperature = overrides.temperature;
+    }
     const strategy = validateStrategy(config.strategy, config.models);
     const needed = [
       strategy.plannerId,

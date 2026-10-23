@@ -20,7 +20,12 @@ export function validateModel(body, previous = {}) {
     } catch {
       throw new AppError("请输入有效的 API Base URL。");
     }
-    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    const local = [
+      "localhost",
+      "127.0.0.1",
+      "[::1]",
+      "host.docker.internal",
+    ].includes(url.hostname);
     if (
       url.username ||
       url.password ||
@@ -33,6 +38,12 @@ export function validateModel(body, previous = {}) {
         "远程模型必须使用 HTTPS；本机模型可使用 HTTP。URL 不可包含凭据、查询或片段。",
       );
     }
+  }
+  if (
+    model === "strategy" ||
+    model.toLowerCase().startsWith("ai-smart-gateway/")
+  ) {
+    throw new AppError("禁止将网关自己的策略模型设为上游，避免循环调用。");
   }
   function number(key, fallback, min, max, integer = false) {
     const value =
@@ -94,6 +105,7 @@ export async function callModel(
       signal: AbortSignal.timeout(model.timeoutMs),
       headers: {
         "Content-Type": "application/json",
+        "X-AI-Gateway-Hop": "1",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
       },
       body: JSON.stringify(body),

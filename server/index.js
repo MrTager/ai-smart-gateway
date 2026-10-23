@@ -71,8 +71,8 @@ export async function createApplication({
       if (route === "/api/config" && method === "GET")
         return send(response, 200, store.publicConfig());
       if (route === "/api/models" && method === "POST") {
-        if (store.state.models.length >= 30)
-          throw new AppError("最多保存 30 个模型。");
+        if (store.state.models.length >= 100)
+          throw new AppError("最多保存 100 个模型。");
         const body = await jsonBody(request);
         const model = validateModel(body);
         model.id = randomUUID();
@@ -186,6 +186,8 @@ export async function createApplication({
         });
       }
       if (route === "/v1/chat/completions" && method === "POST") {
+        if (request.headers["x-ai-gateway-hop"])
+          throw new AppError("检测到网关循环调用。", 508);
         if (
           gatewayKey &&
           !safeToken(request.headers.authorization, `Bearer ${gatewayKey}`)
@@ -194,14 +196,45 @@ export async function createApplication({
         const body = await jsonBody(request);
         if (
           body.model !== "strategy" ||
-          (body.stream !== undefined && body.stream !== false) ||
+          (body.stream !== undefined && typeof body.stream !== "boolean") ||
           Object.keys(body).some(
-            (key) => !["model", "messages", "stream"].includes(key),
+            (key) =>
+              ![
+                "model",
+                "messages",
+                "stream",
+                "stream_options",
+                "max_tokens",
+                "max_completion_tokens",
+                "temperature",
+              ].includes(key),
           )
         )
           throw new AppError(
-            "当前网关仅支持 model=strategy 的非流式文本请求；输出参数请在模型面板配置。",
+            "当前策略网关仅支持文本请求，不支持 tools、工具结果或其他生成参数。",
           );
+        const cap = body.max_completion_tokens ?? body.max_tokens;
+        if (
+          cap !== undefined &&
+          (!Number.isInteger(cap) || cap < 1 || cap > 32768)
+        )
+          throw new AppError(
+            "输出 token 限额必须为 1–32768。每个内部调用受此上限及模型配置共同约束。",
+          );
+        if (
+          body.temperature !== undefined &&
+          (typeof body.temperature !== "number" ||
+            body.temperature < 0 ||
+            body.temperature > 2)
+        )
+          throw new AppError("temperature 必须为 0–2。");
+        if (
+          body.stream_options !== undefined &&
+          (!body.stream ||
+            body.stream_options?.include_usage !== true ||
+            Object.keys(body.stream_options).length !== 1)
+        )
+          throw new AppError("stream_options 仅支持 include_usage=true。");
         if (
           !Array.isArray(body.messages) ||
           !body.messages.length ||
@@ -217,9 +250,35 @@ export async function createApplication({
         const task = body.messages
           .map((message) => `[${message.role}]\n${message.content}`)
           .join("\n\n");
-        const run = engine.create(task, false);
+        const run = engine.create(task, false, {
+          maxTokens: cap,
+          temperature: body.temperature,
+        });
+        let heartbeat;
+        if (body.stream) {
+          response.writeHead(200, {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            "X-Accel-Buffering": "no",
+          });
+          response.write(": strategy-planning\n\n");
+          heartbeat = setInterval(() => {
+            if (!response.destroyed) response.write(": strategy-working\n\n");
+          }, 10000);
+          response.once("close", () => clearInterval(heartbeat));
+        }
         await engine.active.get(run.id);
-        if (run.status !== "completed") throw new AppError(run.error, 502);
+        clearInterval(heartbeat);
+        if (run.status !== "completed") {
+          if (body.stream) {
+            response.write(
+              `data: ${JSON.stringify({ error: { message: run.error, type: "gateway_error" } })}\n\n`,
+            );
+            return response.end("data: [DONE]\n\n");
+          }
+          throw new AppError(run.error, 502);
+        }
         const usage =
           run.totals.input === null
             ? null
@@ -228,7 +287,7 @@ export async function createApplication({
                 completion_tokens: run.totals.output,
                 total_tokens: run.totals.input + run.totals.output,
               };
-        return send(response, 200, {
+        const completion = {
           id: `chatcmpl-${run.id}`,
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
@@ -242,7 +301,25 @@ export async function createApplication({
           ],
           usage,
           gateway_trace_id: run.id,
-        });
+        };
+        if (body.stream) {
+          const { id, created, model } = completion;
+          const chunk = (delta, finish_reason = null, extra = {}) =>
+            response.write(
+              `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`,
+            );
+          chunk({ role: "assistant", content: "" });
+          const characters = Array.from(run.result);
+          for (let offset = 0; offset < characters.length; offset += 128)
+            chunk({ content: characters.slice(offset, offset + 128).join("") });
+          chunk({}, "stop");
+          if (body.stream_options?.include_usage)
+            response.write(
+              `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage })}\n\n`,
+            );
+          return response.end("data: [DONE]\n\n");
+        }
+        return send(response, 200, completion);
       }
       if (method === "GET" && ["/", "/app.js", "/styles.css"].includes(route)) {
         const file = route === "/" ? "index.html" : route.slice(1);
@@ -280,8 +357,18 @@ if (
   const port = Number(process.env.PORT || 4317);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error("Invalid PORT");
-  const { server } = await createApplication();
-  server.listen(port, "127.0.0.1", () =>
+  const host = process.env.HOST || "127.0.0.1";
+  if (!["127.0.0.1", "0.0.0.0"].includes(host))
+    throw new Error("HOST must be 127.0.0.1 or 0.0.0.0");
+  const gatewayKey = process.env.GATEWAY_API_KEY_FILE
+    ? (await readFile(process.env.GATEWAY_API_KEY_FILE, "utf8")).trim()
+    : process.env.GATEWAY_API_KEY || "";
+  if (host === "0.0.0.0" && !gatewayKey)
+    throw new Error(
+      "Container/public bind requires a gateway key; publish Docker ports only on 127.0.0.1",
+    );
+  const { server } = await createApplication({ gatewayKey });
+  server.listen(port, host, () =>
     console.log(`AI智能网关 · http://127.0.0.1:${port} · 仅本机访问`),
   );
 }
