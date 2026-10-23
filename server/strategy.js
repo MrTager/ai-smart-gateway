@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AppError, callModel } from "./provider.js";
+import { LIMITS } from "./limits.js";
 
 export function validateStrategy(body, models) {
   const ids = new Set(models.map((model) => model.id));
@@ -143,11 +144,23 @@ export class Engine {
     this.active = new Map();
   }
   create(task, demo = true, overrides = {}) {
-    if (typeof task !== "string" || !task.trim() || task.length > 24000)
-      throw new AppError("任务不能为空，且不能超过 24,000 字符。");
+    if (typeof task !== "string" || !task.trim())
+      throw new AppError("任务不能为空。");
+    if (
+      task.length > LIMITS.maxTaskCharacters ||
+      Buffer.byteLength(task, "utf8") > LIMITS.maxTaskBytes
+    )
+      throw new AppError(
+        "任务不能为空，且需小于 8,000,000 个 UTF-16 单元和 16 MiB UTF-8 文本。实际 token 容量由上游模型校验。",
+        413,
+      );
     if (this.active.size >= 4)
       throw new AppError("最多同时运行 4 个任务，请稍后重试。", 429);
-    const config = structuredClone(this.store.state);
+    // Never clone large task histories into each model call's configuration snapshot.
+    const config = structuredClone({
+      models: this.store.state.models,
+      strategy: this.store.state.strategy,
+    });
     for (const model of config.models) {
       if (overrides.maxTokens !== undefined)
         model.maxTokens = Math.min(model.maxTokens, overrides.maxTokens);

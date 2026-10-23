@@ -9,6 +9,7 @@ import { createApplication } from "../server/index.js";
 import { Store } from "../server/store.js";
 import { parsePlan, validateStrategy } from "../server/strategy.js";
 import { validateModel } from "../server/provider.js";
+import { LIMITS } from "../server/limits.js";
 
 async function fixture(t, gatewayKey = "") {
   const directory = await mkdtemp(path.join(tmpdir(), "ai-gateway-test-"));
@@ -424,5 +425,51 @@ test("recursive gateway header is rejected before any model is called", async (t
     { "X-AI-Gateway-Hop": "1" },
   );
   assert.equal(response.status, 508);
+  assert.equal(app.store.state.runs.length, 0);
+});
+
+test("large multi-megabyte input reaches planner intact without flooding history previews", async (t) => {
+  const app = await fixture(t);
+  const text =
+    "BEGIN-LONG-SOURCE\n" + "token ".repeat(1_000_000) + "\nEND-LONG-SOURCE";
+  let plannerSawSource = false;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    if (body.messages[0].content.includes("任务规划器")) {
+      assert.equal(body.messages[1].content, "[user]\n" + text);
+      plannerSawSource = true;
+      completion(
+        res,
+        '{"steps":[{"title":"A","instruction":"Return checked"}]}',
+      );
+    } else completion(res, "checked");
+  });
+  await addLive(app, baseUrl);
+  const config = await app.request("/api/config");
+  await app.request("/api/strategy", "PUT", {
+    ...config.body.strategy,
+    review: false,
+  });
+  const response = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages: [{ role: "user", content: text }],
+  });
+  assert.equal(response.status, 200);
+  assert(plannerSawSource);
+  const history = await app.request("/api/runs");
+  assert(history.body[0].task.length <= 360);
+  assert(history.body[0].taskCharacters > 6_000_000);
+  const preview = await app.request(
+    `/api/runs/${history.body[0].id}?preview=1`,
+  );
+  assert.equal(preview.body.task.length, 1200);
+  assert.equal(preview.body.taskTruncated, true);
+  const full = await app.request(`/api/runs/${history.body[0].id}`);
+  assert.equal(full.body.task, "[user]\n" + text);
+});
+
+test("task transport guard rejects huge Unicode input by bytes, not by token claims", async (t) => {
+  const app = await fixture(t);
+  const text = "中".repeat(Math.floor(LIMITS.maxTaskBytes / 3) + 1);
+  assert.throws(() => app.engine.create(text, true), /16 MiB/);
   assert.equal(app.store.state.runs.length, 0);
 });

@@ -1,7 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { routedModels } from "../scripts/connect-opencodex.mjs";
+import {
+  routedModels,
+  contextMetadata,
+} from "../scripts/connect-opencodex.mjs";
 import { validateModel } from "../server/provider.js";
+import { LIMITS } from "../server/limits.js";
+
+test("1M metadata and automatic compaction leave room for output and wrappers", () => {
+  const metadata = contextMetadata();
+  assert.equal(metadata.contextWindow, 1_000_000);
+  assert.equal(metadata.modelContextWindows.strategy, 1_000_000);
+  assert.equal(metadata.modelAutoCompactTokenLimits.strategy, 900_000);
+  assert.equal(LIMITS.maxRequestBytes, 32 * 1024 * 1024);
+});
 
 test("OpenCodex import canonicalizes aliases and excludes the gateway itself", () => {
   assert.deepEqual(

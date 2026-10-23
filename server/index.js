@@ -6,9 +6,9 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { Store } from "./store.js";
 import { AppError, validateModel, callModel } from "./provider.js";
 import { Engine, validateStrategy } from "./strategy.js";
+import { LIMITS } from "./limits.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const limit = 128 * 1024;
 async function jsonBody(request) {
   if (!request.headers["content-type"]?.startsWith("application/json"))
     throw new AppError("请求必须使用 application/json。", 415);
@@ -16,7 +16,11 @@ async function jsonBody(request) {
   const chunks = [];
   for await (const chunk of request) {
     length += chunk.length;
-    if (length > limit) throw new AppError("请求超过 128 KB 限制。", 413);
+    if (length > LIMITS.maxRequestBytes)
+      throw new AppError(
+        "请求超过 32 MiB 传输限制；此限制按字节计算，不是模型 token 容量。",
+        413,
+      );
     chunks.push(chunk);
   }
   try {
@@ -157,6 +161,8 @@ export async function createApplication({
           200,
           store.state.runs.map(({ result, steps, calls, ...run }) => ({
             ...run,
+            task: run.task.slice(0, 360),
+            taskCharacters: run.task.length,
             stepCount: steps.length,
           })),
         );
@@ -170,6 +176,14 @@ export async function createApplication({
           (item) => item.id === route.slice("/api/runs/".length),
         );
         if (!run) throw new AppError("执行记录不存在。", 404);
+        if (url.searchParams.get("preview") === "1") {
+          return send(response, 200, {
+            ...run,
+            task: run.task.slice(0, 1200),
+            taskCharacters: run.task.length,
+            taskTruncated: run.task.length > 1200,
+          });
+        }
         return send(response, 200, run);
       }
       if (route === "/v1/models" && method === "GET") {
@@ -181,7 +195,12 @@ export async function createApplication({
         return send(response, 200, {
           object: "list",
           data: [
-            { id: "strategy", object: "model", owned_by: "ai-smart-gateway" },
+            {
+              id: "strategy",
+              object: "model",
+              owned_by: "ai-smart-gateway",
+              context_window: LIMITS.contextWindowTokens,
+            },
           ],
         });
       }

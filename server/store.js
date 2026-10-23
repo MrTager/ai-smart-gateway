@@ -6,6 +6,7 @@ import {
   randomUUID,
 } from "node:crypto";
 import path from "node:path";
+import { LIMITS } from "./limits.js";
 
 export const initialState = () => ({
   models: [
@@ -129,6 +130,7 @@ export class Store {
   }
   publicConfig() {
     return {
+      limits: LIMITS,
       models: this.state.models.map(({ encryptedKey, ...model }) => ({
         ...model,
         hasKey: Boolean(encryptedKey),

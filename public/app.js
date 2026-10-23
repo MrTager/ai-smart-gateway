@@ -30,6 +30,8 @@ function toast(message) {
   toastTimer = setTimeout(() => $("#toast").classList.remove("show"), 4200);
 }
 async function api(url, method = "GET", body) {
+  // Poll compact previews, not multi-megabyte source text. The plain API still returns the full task.
+  if (method === "GET" && url.startsWith("/api/runs/")) url += "?preview=1";
   const response = await fetch(url, {
     method,
     headers: body ? { "Content-Type": "application/json" } : {},
@@ -131,7 +133,7 @@ function overview() {
       "深度模型负责决策，快速模型负责执行。让协作更清晰，让消耗可衡量。",
       '<button class="button secondary" data-action="add-model">＋ 添加模型</button><a class="button primary" href="#strategy">配置策略 <span>↗</span></a>',
     ) +
-    `<div id="stats-area">${stats()}</div>${flow()}<div class="two-col"><section class="panel"><div class="panel-header"><div class="panel-title"><span class="tiny-icon">✳</span>开始一个任务</div>${pill("TEXT WORKFLOW")}</div><div class="panel-body"><form id="task-form"><label class="task-label" for="task-input">你希望模型协作完成什么？</label><textarea id="task-input" class="task-input" name="task" maxlength="24000" required placeholder="例如：为一个文档转换工具制定产品发布计划，包含目标用户、核心卖点和首周推广步骤。">${esc(state.task)}</textarea><div class="task-toolbar"><label class="switch-label"><input type="checkbox" name="demo" ${state.demo ? "checked" : ""}>演示运行 · 不调用真实 API</label><button class="button primary" type="submit">运行任务 <span>↗</span></button></div><p class="helper">演示展示编排流程，内容为固定示例，Token 为模拟估值。取消勾选后将使用配置的真实模型并产生费用。</p></form></div></section><section class="panel"><div class="panel-header"><div class="panel-title"><span class="tiny-icon">◇</span>模型池</div><a class="text-link" href="#models">管理模型 ↗</a></div><div class="panel-body">${state.config.models
+    `<div id="stats-area">${stats()}</div>${flow()}<div class="two-col"><section class="panel"><div class="panel-header"><div class="panel-title"><span class="tiny-icon">✳</span>开始一个任务</div>${pill("TEXT WORKFLOW")}</div><div class="panel-body"><form id="task-form"><label class="task-label" for="task-input">你希望模型协作完成什么？</label><textarea id="task-input" class="task-input" name="task" maxlength="${state.config.limits.maxTaskCharacters}" required placeholder="例如：为一个文档转换工具制定产品发布计划，包含目标用户、核心卖点和首周推广步骤。">${esc(state.task)}</textarea><div class="task-toolbar"><label class="switch-label"><input type="checkbox" name="demo" ${state.demo ? "checked" : ""}>演示运行 · 不调用真实 API</label><button class="button primary" type="submit">运行任务 <span>↗</span></button></div><p class="helper">演示展示编排流程，内容为固定示例，Token 为模拟估值。取消勾选后将使用配置的真实模型并产生费用。</p></form></div></section><section class="panel"><div class="panel-header"><div class="panel-title"><span class="tiny-icon">◇</span>模型池</div><a class="text-link" href="#models">管理模型 ↗</a></div><div class="panel-body">${state.config.models
       .slice(0, 3)
       .map(
         (model, i) =>

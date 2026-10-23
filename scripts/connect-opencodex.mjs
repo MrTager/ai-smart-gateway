@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { LIMITS } from "../server/limits.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const local = path.join(root, ".local");
@@ -11,6 +12,14 @@ const ocxHome =
   process.env.OPENCODEX_HOME || path.join(homedir(), ".opencodex");
 const providerName = "ai-smart-gateway";
 const gatewayUrl = "http://127.0.0.1:4317";
+
+export function contextMetadata() {
+  return {
+    contextWindow: LIMITS.contextWindowTokens,
+    modelContextWindows: { strategy: LIMITS.contextWindowTokens },
+    modelAutoCompactTokenLimits: { strategy: LIMITS.autoCompactTokens },
+  };
+}
 
 export function routedModels(rows) {
   return [
@@ -169,7 +178,7 @@ export async function connect() {
         defaultModel: "strategy",
         selectedModels: ["strategy"],
         liveModels: true,
-        contextWindow: 8192,
+        ...contextMetadata(),
         defaultMaxOutputTokens: 4096,
         modelReasoningEfforts: { strategy: [] },
         noReasoningModels: ["strategy"],
@@ -181,6 +190,20 @@ export async function connect() {
       },
     });
   }
+  if (existing) {
+    await request(
+      ocxUrl,
+      `/api/providers?name=${providerName}`,
+      adminKey,
+      "PATCH",
+      contextMetadata(),
+    );
+  }
+  await request(ocxUrl, "/api/provider-context-caps", adminKey, "PUT", {
+    provider: providerName,
+    enabled: true,
+    value: LIMITS.contextWindowTokens,
+  });
   const after = JSON.parse(
     await readFile(path.join(ocxHome, "config.json"), "utf8"),
   );
@@ -198,6 +221,8 @@ export async function connect() {
       visible,
       defaultsPreserved: true,
       backupCreated: true,
+      contextWindow: LIMITS.contextWindowTokens,
+      autoCompactTokenLimit: LIMITS.autoCompactTokens,
     }),
   );
 }
