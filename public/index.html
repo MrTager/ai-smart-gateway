@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f5f6f8" />
+    <title>AI智能网关 · 策略控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="#overview"
+        ><span class="brand-mark">A<span>↗</span></span
+        ><span>AI智能网关<small>INTELLIGENT GATEWAY</small></span></a
+      >
+      <div class="workspace">
+        <span class="workspace-avatar">P</span
+        ><span>个人工作空间<small>LOCAL WORKSPACE</small></span
+        ><span class="workspace-dot"></span>
+      </div>
+      <div class="nav-caption">工作台</div>
+      <nav aria-label="主导航">
+        <a href="#overview" data-page="overview"
+          ><span class="nav-icon">▦</span>总览<span class="nav-tag"
+            >⌘ 1</span
+          ></a
+        >
+        <a href="#models" data-page="models"
+          ><span class="nav-icon">◇</span>模型配置<span
+            id="model-count"
+            class="nav-count"
+            >0</span
+          ></a
+        >
+        <a href="#strategy" data-page="strategy"
+          ><span class="nav-icon">⑂</span>策略编排</a
+        >
+        <a href="#runs" data-page="runs"
+          ><span class="nav-icon">◷</span>执行记录</a
+        >
+      </nav>
+      <div class="sidebar-note">
+        <span class="small-spark">✳</span
+        ><strong>让每个模型，各尽所长。</strong>
+        <p>用深度思考规划方向，<br />用轻量执行推进任务。</p>
+        <a href="#strategy">配置你的策略 <span>↗</span></a>
+      </div>
+      <div class="sidebar-footer">
+        <span class="connection-dot"></span>本地服务<span class="version"
+          >v0.1.0</span
+        >
+      </div>
+    </aside>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <span class="muted">工作台</span><span class="slash">/</span
+          ><span id="breadcrumb">总览</span>
+        </div>
+        <div class="topbar-right">
+          <span class="local-badge"
+            ><span class="connection-dot"></span>本地运行</span
+          ><span class="top-divider"></span><span class="avatar">P</span>
+        </div>
+      </header>
+      <main id="content" tabindex="-1"></main>
+      <footer class="page-footer">
+        <span
+          >AI 智能网关
+          <span class="footer-dot">·</span> 为更高效的模型协作而设计</span
+        ><span>LOCAL-FIRST / STRATEGY MODE</span>
+      </footer>
+    </div>
+    <dialog id="model-dialog" aria-labelledby="model-dialog-title">
+      <form
+        id="model-form"
+        method="post"
+        action="/api/models"
+        autocomplete="off"
+      >
+        <div class="dialog-heading">
+          <div>
+            <span class="eyebrow">MODEL CONNECTION</span>
+            <h2 id="model-dialog-title">添加模型</h2>
+          </div>
+          <button
+            type="button"
+            class="icon-button"
+            data-action="close-modal"
+            aria-label="关闭"
+          >
+            ×
+          </button>
+        </div>
+        <input type="hidden" name="id" />
+        <div class="form-grid">
+          <label
+            >显示名称<input
+              name="name"
+              required
+              maxlength="100"
+              placeholder="例如：深度决策模型"
+          /></label>
+          <label
+            >连接类型<select name="kind">
+              <option value="live">真实模型 · API 调用</option>
+              <option value="demo">演示模型 · 不调用 API</option>
+            </select></label
+          >
+          <label class="span-2"
+            >API Base URL<input
+              name="baseUrl"
+              placeholder="https://api.openai.com/v1"
+            /><small
+              >填到 /v1 等前缀，不包含 /chat/completions。远程地址必须
+              HTTPS。</small
+            ></label
+          >
+          <label
+            >模型 ID<input
+              name="model"
+              required
+              placeholder="服务商提供的模型 ID"
+          /></label>
+          <label
+            >API Key<input
+              name="apiKey"
+              type="password"
+              autocomplete="new-password"
+              placeholder="留空保留已有密钥"
+            /><small>更换地址后需重新输入密钥。</small></label
+          >
+          <label
+            >最大输出 token<input
+              name="maxTokens"
+              type="number"
+              min="64"
+              max="32768"
+              value="2048"
+              required
+          /></label>
+          <label
+            >输出额度参数<select name="tokenParameter">
+              <option value="max_tokens">max_tokens</option>
+              <option value="max_completion_tokens">
+                max_completion_tokens
+              </option>
+            </select></label
+          >
+          <label
+            >温度<input
+              name="temperature"
+              type="number"
+              min="0"
+              max="2"
+              step="0.1"
+              value="0.3"
+            /><small>留空表示不发送，适合不支持温度的模型。</small></label
+          >
+          <label
+            >超时（秒）<input
+              name="timeoutSeconds"
+              type="number"
+              min="1"
+              max="300"
+              value="60"
+              required
+          /></label>
+          <label
+            >输入单价（USD / 百万 token）<input
+              name="inputPrice"
+              type="number"
+              min="0"
+              max="100000"
+              step="any"
+              placeholder="可选，按服务商实际价格填写"
+          /></label>
+          <label
+            >输出单价（USD / 百万 token）<input
+              name="outputPrice"
+              type="number"
+              min="0"
+              max="100000"
+              step="any"
+              placeholder="可选，按服务商实际价格填写"
+          /></label>
+        </div>
+        <label class="checkbox-line"
+          ><input name="jsonMode" type="checkbox" />支持 response_format JSON
+          模式（用于决策模型）</label
+        >
+        <label class="checkbox-line"
+          ><input name="clearKey" type="checkbox" />清除已保存的密钥</label
+        >
+        <p class="form-security">
+          ⌑ 密钥在本机加密保存，不回传前端。模型响应和任务记录也仅保存在本机。
+        </p>
+        <p id="model-error" class="error-text" role="alert"></p>
+        <div class="dialog-actions">
+          <button
+            type="button"
+            class="button secondary"
+            data-action="close-modal"
+          >
+            取消</button
+          ><button type="submit" class="button primary">
+            保存模型 <span>↗</span>
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <div id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
