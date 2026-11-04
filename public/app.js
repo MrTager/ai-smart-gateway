@@ -167,6 +167,15 @@ function options(selected, empty = false) {
       .join("")
   );
 }
+function officeRoutingControl(s) {
+  return `<section class="panel"><div class="panel-body"><label class="checkbox-line"><input form="strategy-form" name="officeRoutingEnabled" type="checkbox" ${s.officeRoutingEnabled ? "checked" : ""}>Word / Excel 优先使用快速模型</label><p>Kimi 高速 → Kimi → 国产 Flash → Luna / Terra Fast。复杂公式、财务、宏、重要审校交给决策模型。适用于 Codex 原生工具入口；工具续接沿用原模型，容量不足或上游明确失败时有限切换，最多三次请求。</p></div></section>`;
+}
+function decisionControl(s) {
+  const mode = s.decisionMode || "supervised";
+  return `<section class="panel"><div class="panel-body"><div class="form-grid"><label>原生对话的决策方式<select form="strategy-form" name="decisionMode">${[
+    ["supervised", "持续监督（推荐）"], ["initial", "仅首次路由（兼容模式）"], ["always", "每轮决策（增加耗时）"],
+  ].map(([value, label]) => `<option value="${value}" ${mode === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label>每隔几轮工具结果检查进度<input form="strategy-form" name="decisionReviewInterval" type="number" min="1" max="12" value="${s.decisionReviewInterval ?? 4}" required></label></div><p class="helper">持续监督：新任务先决策；工具报错、重复执行或达到检查间隔时重新决策。正常续接沿用原模型与建议，简单问候和天气查询可直达。决策模型可以亲自接管复杂任务。每次决策都会增加一次模型调用，执行记录会显示触发原因和实际调用模型。文本子任务工作台仍按原计划调度。</p></div></section>`;
+}
 function strategyPage() {
   const s = state.config.strategy;
   return (
@@ -176,7 +185,7 @@ function strategyPage() {
       "一次规划，多路执行。你决定谁来思考，谁来行动。",
       pill("策略模式", "green"),
     ) +
-    flow() +
+    flow() + decisionControl(s) + officeRoutingControl(s) +
     `<div class="strategy-grid"><section class="panel"><div class="panel-header"><div class="panel-title">角色与调度设置</div>${pill("可配置")}</div><div class="panel-body"><form id="strategy-form"><div class="form-grid"><label class="span-2">决策模型<select name="plannerId" required>${options(s.plannerId)}</select><small>分析任务，生成结构化步骤、模型分工与依赖关系。</small></label><div class="span-2"><label>执行模型池</label>${state.config.models.map((model) => `<label class="executor-option"><input type="checkbox" name="executorIds" value="${esc(model.id)}" ${s.executorIds.includes(model.id) ? "checked" : ""}>${esc(model.name)}<small>${esc(model.model)}</small></label>`).join("")}</div><label>最多子任务<input name="maxSteps" type="number" min="1" max="8" value="${s.maxSteps}" required></label><label>并行执行数<input name="concurrency" type="number" min="1" max="4" value="${s.concurrency}" required></label><label class="span-2">复核模型<select name="reviewerId">${options(s.reviewerId, true)}</select></label></div><label class="checkbox-line"><input type="checkbox" name="review" ${s.review ? "checked" : ""}>执行完毕后使用复核模型整合结果（增加一次调用）</label><label>附加规划偏好<textarea name="plannerPrompt" rows="3" maxlength="4000">${esc(s.plannerPrompt)}</textarea></label><div class="dialog-actions"><button type="submit" class="button primary">保存策略 <span>✓</span></button></div></form></div></section><div><section class="panel strategy-explanation"><h3>模型如何协作？</h3><div class="explanation-step" data-step="1"><strong>先规划，再执行</strong><p>决策模型只输出结构化计划，不重复完成整个任务。执行模型只接收当前指令与直接依赖的结果。</p></div><div class="explanation-step" data-step="2"><strong>有依赖的顺序执行</strong><p>独立步骤最多按并行数同时执行；依赖步骤等待前置任务完成，循环和无效依赖会被拒绝。</p></div><div class="explanation-step" data-step="3"><strong>复核按需开启</strong><p>默认直接交付最终步骤的输出。开启复核后，额外调用所选模型整合、审查所有步骤。</p></div></section><div class="notice">不是每个任务都需要多模型。规划、交接和复核都有成本；请用同一任务比较结果质量、总耗时和实际费用。当前不提供未经测量的“节省率”。</div></div></div>`
   );
 }
@@ -359,6 +368,9 @@ document.addEventListener("submit", async (event) => {
     if (formId === "strategy-form") {
       const body = {
         ...Object.fromEntries(data),
+        officeRoutingEnabled: data.has("officeRoutingEnabled"),
+        decisionMode: data.get("decisionMode"),
+        decisionReviewInterval: Number(data.get("decisionReviewInterval")),
         executorIds: data.getAll("executorIds"),
         review: data.has("review"),
         maxSteps: Number(data.get("maxSteps")),

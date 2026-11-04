@@ -1,8 +1,29 @@
+import { REASONING_EFFORTS } from "./reasoning.js";
+
 export class AppError extends Error {
   constructor(message, status = 400) {
     super(message);
     this.status = status;
   }
+}
+
+const FAILURE_KINDS = new Set([
+  "cancelled", "timeout", "connection", "response_read", "upstream_http",
+  "invalid_response", "response_too_large",
+]);
+const FAILURE_PHASES = new Set(["headers", "body"]);
+
+// Only fixed diagnostic labels may leave the transport layer, never raw causes,
+// abort reasons, upstream response bodies, URLs or credentials.
+export function failureDetails(error) {
+  return {
+    ...(FAILURE_KINDS.has(error?.failureKind) ? { failureKind: error.failureKind } : {}),
+    ...(FAILURE_PHASES.has(error?.failurePhase) ? { failurePhase: error.failurePhase } : {}),
+  };
+}
+
+function modelFailure(message, kind, phase, status = 502) {
+  return Object.assign(new AppError(message, status), { failureKind: kind, failurePhase: phase });
 }
 
 export function validateModel(body, previous = {}) {
@@ -62,6 +83,10 @@ export function validateModel(body, previous = {}) {
       return null;
     return number(key, 0, 0, 100000);
   }
+  const reasoningEfforts = body.reasoningEfforts ?? previous.reasoningEfforts;
+  if (reasoningEfforts !== undefined &&
+      (!Array.isArray(reasoningEfforts) || reasoningEfforts.some((e) => !REASONING_EFFORTS.includes(e))))
+    throw new AppError("reasoningEfforts 必须为受支持档位的数组。");
   return {
     id: previous.id,
     name,
@@ -80,6 +105,7 @@ export function validateModel(body, previous = {}) {
     inputPrice: price("inputPrice"),
     outputPrice: price("outputPrice"),
     contextWindow: number("contextWindow", 128000, 4096, 2000000, true),
+    ...(reasoningEfforts !== undefined ? { reasoningEfforts: [...new Set(reasoningEfforts)] } : {}),
   };
 }
 
@@ -106,14 +132,24 @@ export async function callModel(
   if (json && model.jsonMode) body.response_format = { type: "json_object" };
   Object.assign(body, parameters);
   const started = performance.now();
+  const timeoutSignal = AbortSignal.timeout(model.timeoutMs);
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  const transportFailure = phase => {
+    // Preserve the first abort's cause even if the other signal aborts later.
+    if (timeoutSignal.aborted && requestSignal.reason === timeoutSignal.reason)
+      return modelFailure("模型调用超时；请检查超时配置或稍后重试。", "timeout", phase);
+    if (signal?.aborted && requestSignal.reason === signal.reason)
+      return modelFailure("客户端已取消请求。", "cancelled", phase, 499);
+    return phase === "headers"
+      ? modelFailure("模型连接失败；请检查地址与网络。", "connection", phase)
+      : modelFailure("模型响应读取中断；请检查网络或上游服务状态。", "response_read", phase);
+  };
   let response;
   try {
     response = await fetch(`${model.baseUrl}/chat/completions`, {
       method: "POST",
       redirect: "error",
-      signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(model.timeoutMs)])
-        : AbortSignal.timeout(model.timeoutMs),
+      signal: requestSignal,
       headers: {
         "Content-Type": "application/json",
         "X-AI-Gateway-Hop": "1",
@@ -122,45 +158,57 @@ export async function callModel(
       body: JSON.stringify(body),
     });
   } catch {
-    throw new AppError("模型连接失败或超时；请检查地址、网络及超时配置。", 502);
+    throw transportFailure("headers");
   }
   // Never reflect upstream error bodies: some providers echo credentials/request data.
   if (!response.ok) {
-    await response.body?.cancel();
-    throw new AppError(
+    try { await response.body?.cancel(); } catch { /* Keep the explicit HTTP status. */ }
+    const error = modelFailure(
       `模型服务返回 HTTP ${response.status}，请检查配置或配额。`,
-      502,
+      "upstream_http", "headers",
     );
+    error.upstreamStatus = response.status;
+    throw error;
   }
-  const reader = response.body.getReader();
+  let reader;
   const chunks = [];
   let bytes = 0;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    bytes += value.length;
-    if (bytes > 2 * 1024 * 1024) {
-      await reader.cancel();
-      throw new AppError("模型响应超过 2 MB 限制。", 502);
+  try {
+    if (!response.body)
+      throw modelFailure("模型服务未返回响应正文。", "invalid_response", "body");
+    reader = response.body.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.length;
+      if (bytes > 2 * 1024 * 1024) {
+        try { await reader.cancel(); } catch { /* Preserve the size-limit error. */ }
+        throw modelFailure("模型响应超过 2 MB 限制。", "response_too_large", "body");
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw transportFailure("body");
+  } finally {
+    reader?.releaseLock();
   }
   let data;
   try {
     data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
-    throw new AppError("模型服务返回了无效 JSON。", 502);
+    throw modelFailure("模型服务返回了无效 JSON。", "invalid_response", "body");
   }
-  const message = data.choices?.[0]?.message;
+  const message = data?.choices?.[0]?.message;
   const content = message?.content;
-  const finishReason = data.choices?.[0]?.finish_reason || "stop";
+  const finishReason = data?.choices?.[0]?.finish_reason || "stop";
   const hasToolCalls =
     Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
   if (
     !message ||
     (typeof content !== "string" && content !== null && content !== undefined)
   )
-    throw new AppError("模型返回了无效的 assistant 消息。", 502);
+    throw modelFailure("模型返回了无效的 assistant 消息。", "invalid_response", "body");
   if (
     (!native ||
       (!hasToolCalls && !message.refusal && finishReason !== "length")) &&

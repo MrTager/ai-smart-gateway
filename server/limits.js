@@ -6,3 +6,8 @@ export const LIMITS = Object.freeze({
   maxTaskBytes: 16 * 1024 * 1024,
   maxTaskCharacters: 8_000_000,
 });
+
+export function modelFitsContext(model, inputTokens, outputCap) {
+  return inputTokens + Math.min(outputCap ?? model.maxTokens, model.maxTokens) <=
+    Math.min(model.contextWindow ?? 128000, LIMITS.contextWindowTokens);
+}

@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LIMITS } from "../server/limits.js";
+import { REASONING_EFFORTS } from "../server/reasoning.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const local = path.join(root, ".local");
@@ -25,7 +26,13 @@ export function agentMetadata() {
   return {
     modelDisplayNames: { strategy: "AI智能网关·策略模型" },
     preserveReasoningContentModels: ["strategy"],
-    note: "原生文本与函数工具协议；工具由 Codex 客户端执行。简单任务直达执行模型，复杂任务由决策模型规划路由。仅响应客户端显式压缩。",
+    modelReasoningEfforts: { strategy: [...REASONING_EFFORTS] },
+    modelReasoningEffortMap: { strategy: Object.fromEntries(
+      REASONING_EFFORTS.map((effort) => [effort, effort === "ultra" ? "max" : effort]),
+    ) },
+    noReasoningModels: [],
+    defaultMaxOutputTokens: 32768,
+    note: "原生文本与函数工具协议；工具由 Codex 客户端执行。新任务由配置的决策模型规划，工具失败或到达检查间隔时重新决策；简单问候可直达。仅响应客户端显式压缩。",
   };
 }
 
@@ -46,13 +53,18 @@ export function routedModels(rows) {
 }
 
 export function catalogContextWindow(slug, rows) {
+  const window = catalogModelRow(slug, rows)?.context_window;
+  return Number.isInteger(window) ? window : undefined;
+}
+
+export function catalogModelRow(slug, rows) {
   const baseSlug = slug.replace(/--fast$/, "");
   const row =
     rows.find((row) => row.slug === slug) ||
     rows.find((row) => row.slug === baseSlug) ||
     (baseSlug.startsWith("openai/") &&
       rows.find((row) => row.slug === baseSlug.slice("openai/".length)));
-  return Number.isInteger(row?.context_window) ? row.context_window : undefined;
+  return row;
 }
 
 async function request(base, route, key, method = "GET", body) {
@@ -85,7 +97,7 @@ export async function prepare() {
   await chmod(secretPath, 0o644);
 }
 
-export async function connect() {
+export async function connect({ refreshCapabilities = false } = {}) {
   await prepare();
   const gatewayKey = (await readFile(secretPath, "utf8")).trim();
   const runtime = JSON.parse(
@@ -127,6 +139,7 @@ export async function connect() {
     gatewayConfig.models.map((model) => [model.model, model]),
   );
   const contextWindows = new Map();
+  const reasoningEfforts = new Map();
   try {
     const catalog = JSON.parse(
       await readFile(
@@ -140,6 +153,10 @@ export async function connect() {
     for (const slug of models) {
       const window = catalogContextWindow(slug, catalog.models || []);
       if (window) contextWindows.set(slug, window);
+      const row = catalogModelRow(slug, catalog.models || []);
+      if (Array.isArray(row?.supported_reasoning_levels))
+        reasoningEfforts.set(slug, row.supported_reasoning_levels.map((r) => r.effort)
+          .filter((e) => REASONING_EFFORTS.includes(e)));
     }
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
@@ -148,6 +165,16 @@ export async function connect() {
     const previous = bySlug.get(slug);
     // Do not rewrite user-edited model configurations on subsequent runs.
     if (previous) {
+      if (refreshCapabilities && previous.name.startsWith("OpenCodex") && previous.baseUrl === upstreamUrl) {
+        await request(gatewayUrl, `/api/models/${previous.id}`, gatewayKey, "PUT", {
+          ...previous,
+          ...(contextWindows.has(slug) ? { contextWindow: contextWindows.get(slug) } : {}),
+          ...(reasoningEfforts.has(slug) ? { reasoningEfforts: reasoningEfforts.get(slug) } : {}),
+          maxTokens: previous.maxTokens === 4096 ? 32768 : previous.maxTokens,
+          apiKey: "",
+        });
+        continue;
+      }
       if (!previous.contextWindow && contextWindows.has(slug))
         await request(
           gatewayUrl,
@@ -169,7 +196,7 @@ export async function connect() {
         model: slug,
         baseUrl: upstreamUrl,
         apiKey: upstreamKey,
-        maxTokens: 4096,
+        maxTokens: 32768,
         temperature: null,
         timeoutMs: 180000,
         tokenParameter: "max_tokens",
@@ -177,6 +204,7 @@ export async function connect() {
         inputPrice: null,
         outputPrice: null,
         contextWindow: contextWindows.get(slug) || 128000,
+        ...(reasoningEfforts.has(slug) ? { reasoningEfforts: reasoningEfforts.get(slug) } : {}),
       },
     );
     bySlug.set(
@@ -226,9 +254,6 @@ export async function connect() {
         selectedModels: ["strategy"],
         liveModels: true,
         ...contextMetadata(),
-        defaultMaxOutputTokens: 4096,
-        modelReasoningEfforts: { strategy: [] },
-        noReasoningModels: ["strategy"],
         noVisionModels: ["strategy"],
         noTemperatureModels: ["strategy"],
         noTopPModels: ["strategy"],
@@ -237,13 +262,18 @@ export async function connect() {
     });
   }
   if (existing) {
-    const { modelDisplayNames, ...metadata } = agentMetadata();
+    // The management PATCH mask does not own reasoning ladders/output defaults.
+    // Round-trip the current provider via POST so these fields really persist.
+    const current = JSON.parse(await readFile(path.join(ocxHome, "config.json"), "utf8"));
+    if (current.providers[providerName]?.baseUrl !== `${gatewayUrl}/v1`)
+      throw new Error("更新期间网关地址改变，停止同步。");
     await request(
       ocxUrl,
-      `/api/providers?name=${providerName}`,
+      "/api/providers",
       adminKey,
-      "PATCH",
-      { ...contextMetadata(), ...metadata },
+      "POST",
+      { name: providerName, setDefault: false,
+        provider: { ...current.providers[providerName], ...contextMetadata(), ...agentMetadata() } },
     );
   }
   await request(
@@ -266,6 +296,11 @@ export async function connect() {
   );
   if (after.defaultProvider !== before.defaultProvider)
     throw new Error("默认渠道发生变化，请检查备份。");
+  const savedProvider = after.providers[providerName];
+  if (JSON.stringify(savedProvider.modelReasoningEfforts?.strategy) !== JSON.stringify(REASONING_EFFORTS) ||
+      savedProvider.noReasoningModels?.includes("strategy") || savedProvider.defaultMaxOutputTokens !== 32768 ||
+      savedProvider.modelContextWindows?.strategy !== LIMITS.contextWindowTokens)
+    throw new Error("网关能力字段未成功保存，请检查管理 API 配置。");
   const visible = (await request(ocxUrl, "/v1/models", upstreamKey)).data?.some(
     (model) => model.id === `${providerName}/strategy`,
   );
@@ -297,7 +332,7 @@ if (
     if (process.argv.includes("--prepare")) {
       await prepare();
       console.log("Local Docker secret prepared; no credentials printed.");
-    } else await connect();
+    } else await connect({ refreshCapabilities: process.argv.includes("--refresh-capabilities") });
   } catch (error) {
     console.error(`OpenCodex integration: ${error.message}`);
     process.exitCode = 1;

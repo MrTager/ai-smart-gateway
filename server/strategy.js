@@ -1,8 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { AppError, callModel } from "./provider.js";
+import { AppError, callModel, failureDetails } from "./provider.js";
 import { LIMITS } from "./limits.js";
+import { recordModelCall } from "./call-accounting.js";
+import { DECISION_MODES, DEFAULT_REVIEW_INTERVAL } from "./decision-routing.js";
+export { totals } from "./call-accounting.js";
 
 export function validateStrategy(body, models) {
+  const decisionMode = body.decisionMode ?? "supervised";
+  const decisionReviewInterval = body.decisionReviewInterval ?? DEFAULT_REVIEW_INTERVAL;
+  if (!DECISION_MODES.includes(decisionMode))
+    throw new AppError("决策方式必须为 supervised、initial 或 always。");
+  if (!Number.isInteger(decisionReviewInterval) || decisionReviewInterval < 1 || decisionReviewInterval > 12)
+    throw new AppError("决策检查间隔必须为 1–12 轮工具结果。");
+  if (body.officeRoutingEnabled !== undefined && typeof body.officeRoutingEnabled !== "boolean")
+    throw new AppError("Office 优先路由开关必须为 boolean。");
   const ids = new Set(models.map((model) => model.id));
   if (!ids.has(body.plannerId)) throw new AppError("请选择决策模型。");
   if (
@@ -31,6 +42,9 @@ export function validateStrategy(body, models) {
     executorIds: [...new Set(body.executorIds)],
     reviewerId: body.reviewerId || "",
     review: Boolean(body.review),
+    officeRoutingEnabled: body.officeRoutingEnabled === true,
+    decisionMode,
+    decisionReviewInterval,
     maxSteps,
     concurrency,
     plannerPrompt: String(body.plannerPrompt || "").slice(0, 4000),
@@ -123,20 +137,6 @@ export function demoPlan(task, maximum) {
     })),
   };
 }
-
-export function totals(calls) {
-  const complete = calls.every((call) => call.usage.source !== "unavailable");
-  return {
-    input: complete ? calls.reduce((n, c) => n + c.usage.input, 0) : null,
-    output: complete ? calls.reduce((n, c) => n + c.usage.output, 0) : null,
-    cost:
-      calls.length && calls.every((call) => cHasCost(call))
-        ? calls.reduce((n, c) => n + c.cost, 0)
-        : null,
-    calls: calls.length,
-  };
-}
-const cHasCost = (call) => typeof call.cost === "number";
 
 export class Engine {
   constructor(store) {
@@ -231,23 +231,17 @@ export class Engine {
         cost: null,
         latencyMs: 260,
       };
-    } else {
-      result = await callModel(model, messages, {
-        apiKey: this.store.decrypt(model.encryptedKey),
-        json: options.json,
-      });
     }
-    run.calls.push({
-      role,
-      modelId: model.id,
-      modelName: model.name,
-      usage: result.usage,
-      cost: result.cost,
-      latencyMs: result.latencyMs,
-    });
-    run.totals = totals(run.calls);
-    await this.store.save();
-    return result.content;
+    // Local decryption errors happen before any upstream attempt and are not calls.
+    const apiKey = run.demo ? "" : this.store.decrypt(model.encryptedKey);
+    try {
+      const recorded = await recordModelCall(run, model, role, () =>
+        run.demo ? result : callModel(model, messages, { apiKey, json: options.json }),
+      );
+      return recorded.content;
+    } finally {
+      await this.store.save();
+    }
   }
   async execute(run, config, strategy) {
     const started = performance.now();
@@ -394,6 +388,7 @@ export class Engine {
       run.stage = "done";
     } catch (error) {
       run.status = "failed";
+      Object.assign(run, failureDetails(error));
       run.error =
         error instanceof AppError
           ? error.message

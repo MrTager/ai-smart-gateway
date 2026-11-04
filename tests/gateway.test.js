@@ -15,6 +15,9 @@ import { COMPACTION_MARKER } from "../server/native-chat.js";
 async function fixture(t, gatewayKey = "") {
   const directory = await mkdtemp(path.join(tmpdir(), "ai-gateway-test-"));
   const app = await createApplication({ directory, gatewayKey });
+  // Existing protocol/Office fixtures exercise the explicitly selectable legacy route.
+  // Supervised defaults and checkpoints are covered in decision-routing.test.js.
+  app.store.state.strategy.decisionMode = "initial";
   app.server.listen(0, "127.0.0.1");
   await once(app.server, "listening");
   t.after(async () => {
@@ -254,7 +257,13 @@ test("upstream failure is recorded without secret echo or demo fallback", async 
   assert.match(run.error, /401/);
   assert.equal(run.result, "");
   assert(!JSON.stringify(run).includes("private-test-key"));
-  assert.equal(run.calls.length, 0);
+  assert.equal(run.calls.length, 1);
+  assert.equal(run.calls[0].status, "failed");
+  assert.equal(run.calls[0].upstreamStatus, 401);
+  assert.equal(run.failureKind, "upstream_http");
+  assert.equal(run.failurePhase, "headers");
+  assert.equal(run.calls[0].failureKind, "upstream_http");
+  assert.deepEqual(run.totals, { input: null, output: null, cost: null, calls: 1 });
 });
 test("missing usage stays unknown instead of becoming zero", async (t) => {
   const app = await fixture(t);
@@ -716,6 +725,127 @@ test("orphaned tool output is rejected before any inference", async (t) => {
   assert.equal(app.store.state.runs.length, 0);
 });
 
+test("a null historical tool call is rejected as 400 without creating a model run", async t => {
+  const app = await fixture(t);
+  const response = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy",
+    messages: [{ role: "assistant", content: null, tool_calls: [null] }],
+  });
+  assert.equal(response.status, 400);
+  assert.match(response.body.error.message, /工具调用格式/);
+  assert.equal(app.store.state.runs.length, 0);
+});
+
+test("nullable assistant tool calls can be returned and used in a later conversation", async t => {
+  const app = await fixture(t);
+  let count = 0;
+  let continuation;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    if (count === 2) assert.deepEqual(body.messages, continuation);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "draft", tool_calls: null }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    }));
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const messages = [{ role: "user", content: "hello" }];
+  const first = await app.request("/v1/chat/completions", "POST", { model: "strategy", messages });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.choices[0].message.tool_calls, null);
+  continuation = [...messages, first.body.choices[0].message, { role: "user", content: "continue" }];
+  const second = await app.request("/v1/chat/completions", "POST", { model: "strategy", messages: continuation });
+  assert.equal(second.status, 200);
+  assert.equal(count, 2);
+});
+
+test("malformed upstream tool calls are diagnosed without retries or released calls", async t => {
+  const app = await fixture(t);
+  const call = { id: "valid-id", type: "function", function: { name: "get_weather", arguments: "{}" } };
+  let invalid;
+  let count = 0;
+  const baseUrl = await provider(t, (_body, _req, res) => {
+    count++;
+    toolCompletion(res, invalid, "provider text");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const cases = [[null], {}, "invalid", [{ ...call, id: 123 }], [call, call], []];
+  for (const [index, calls] of cases.entries()) {
+    invalid = calls;
+    const response = await app.request("/v1/chat/completions", "POST", {
+      model: "strategy", messages: [{ role: "user", content: "杭州天气" }], tools: weatherTools,
+    });
+    assert.equal(response.status, 502);
+    assert.match(response.body.error.message, /工具/);
+    assert.equal(response.body.choices, undefined);
+    assert.equal(count, index + 1);
+    const run = app.store.state.runs[0];
+    assert.equal(run.failureKind, "invalid_response");
+    assert.equal(run.failurePhase, "body");
+    assert.equal(run.calls.length, 1);
+    assert.equal(run.totals.input, 10);
+    assert.equal(run.totals.output, 5);
+    assert.equal(run.totals.calls, 1);
+  }
+});
+
+test("text-only review cannot introduce a tool call even if the client declared that tool", async t => {
+  const app = await fixture(t);
+  let count = 0;
+  const call = { id: "review-call", type: "function", function: { name: "get_weather", arguments: "{}" } };
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    if (count === 1) return completion(res, "draft answer");
+    assert.equal(body.tools, undefined);
+    toolCompletion(res, [call]);
+  });
+  await addLive(app, baseUrl);
+  const response = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy", messages: [{ role: "user", content: "hello" }], tools: weatherTools,
+  });
+  assert.equal(response.status, 502);
+  assert.equal(response.body.choices, undefined);
+  assert.equal(count, 2);
+  const run = app.store.state.runs[0];
+  assert.equal(run.status, "failed");
+  assert.equal(run.failureKind, "invalid_response");
+  assert.equal(run.outputToolCallIds, undefined);
+  assert.equal(run.totals.calls, 2);
+  assert.equal(run.totals.input, 30);
+});
+
+test("streaming review failures emit an error event without releasing tool deltas", async t => {
+  const app = await fixture(t);
+  let count = 0;
+  const call = { id: "stream-review-call", type: "function", function: { name: "get_weather", arguments: "{}" } };
+  const baseUrl = await provider(t, (_body, _req, res) => {
+    count++;
+    if (count === 1) return completion(res, "draft answer");
+    toolCompletion(res, [call]);
+  });
+  await addLive(app, baseUrl);
+  const response = await fetch(app.url + "/v1/chat/completions", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "strategy", messages: [{ role: "user", content: "hello" }],
+      tools: weatherTools, stream: true,
+    }),
+  });
+  const raw = await response.text();
+  const events = raw.split("\n")
+    .filter(line => line.startsWith("data: ") && !line.includes("[DONE]"))
+    .map(line => JSON.parse(line.slice(6)));
+  assert.equal(response.status, 200);
+  assert(events.some(event => /工具/.test(event.error?.message)));
+  assert(!events.some(event => event.choices?.some(choice => choice.delta?.tool_calls)));
+  assert(raw.includes("[DONE]"));
+  assert.equal(count, 2);
+  assert.equal(app.store.state.runs[0].status, "failed");
+});
+
 test("long native turns use the larger-context model without truncating original messages", async (t) => {
   const app = await fixture(t);
   const messages = [{ role: "user", content: "word ".repeat(4000) }];
@@ -834,6 +964,7 @@ test("native output truncation retains finish_reason=length instead of becoming 
   assert.equal(answer.status, 200);
   assert.equal(answer.body.choices[0].finish_reason, "length");
   assert.equal(answer.body.choices[0].message.content, "partial");
+  assert.equal(app.store.state.runs[0].incompleteReason, "max_output_tokens");
 });
 
 test("client cancellation aborts the native inference instead of leaving an active model call", async (t) => {
@@ -867,6 +998,12 @@ test("client cancellation aborts the native inference instead of leaving an acti
   assert.equal(app.engine.active.size, 0);
   assert.equal(app.store.state.runs[0].status, "failed");
   assert.match(app.store.state.runs[0].error, /取消/);
+  const run = app.store.state.runs[0];
+  assert.equal(run.failureKind, "cancelled");
+  assert.equal(run.calls.length, 1);
+  assert.equal(run.calls[0].status, "failed");
+  assert.equal(run.calls[0].failureKind, "cancelled");
+  assert.deepEqual(run.totals, { input: null, output: null, cost: null, calls: 1 });
 });
 
 test("large native conversations exercise the tokenizer estimate without truncation", async (t) => {
@@ -939,4 +1076,233 @@ test("tool continuations stay on the producing model when the executor pool orde
   assert.equal(answer.status, 200);
   assert.equal(count, 2);
   assert.equal(app.store.state.runs[0].executionModelId, firstModel.id);
+});
+
+async function officeFixture(t, handler, extra = {}) {
+  const app = await fixture(t);
+  const baseUrl = await provider(t, handler);
+  const planner = await addLive(app, baseUrl, { model: "openai/gpt-6.1-sol--fast" });
+  const result = await app.request("/api/models", "POST", {
+    name: "Office Kimi", kind: "live", model: "kimi-code/k3.1-pro-highspeed", baseUrl, ...extra,
+  });
+  const kimi = result.body.models.at(-1);
+  await app.request("/api/strategy", "PUT", { ...result.body.strategy, review: false, officeRoutingEnabled: true });
+  return { app, baseUrl, planner, kimi };
+}
+
+test("routine Office tasks skip planning and preserve tool protocol across continuations", async (t) => {
+  let count = 0;
+  const call = { id: "office-tool", type: "function", function: { name: "get_weather", arguments: "{}" } };
+  const messages = [{ role: "system", content: "Keep permissions." }, { role: "user", content: "整理 Excel 工作簿并统一格式，不要修改公式。" }];
+  const { app, kimi } = await officeFixture(t, (body, _req, res) => {
+    assert.equal(body.model, "kimi-code/k3.1-pro-highspeed");
+    assert.deepEqual(body.tools, weatherTools);
+    assert.deepEqual(body.messages.slice(0,2), messages);
+    if (++count === 1) return toolCompletion(res, [call]);
+    completion(res, "done");
+  });
+  const first = await app.request("/v1/chat/completions", "POST", { model: "strategy", messages, tools: weatherTools });
+  assert.equal(first.status, 200);
+  const second = await app.request("/v1/chat/completions", "POST", { model: "strategy", tools: weatherTools, messages: [...messages, first.body.choices[0].message, { role:"tool", tool_call_id:call.id, content:"result" }] });
+  assert.equal(second.status, 200);
+  assert.equal(app.store.state.runs[0].executionModelId, kimi.id);
+  assert.equal(app.store.state.runs[0].routeReason,"office-tool-continuation");
+  assert.equal(count,2);
+});
+
+test("sensitive Office work escalates and old Office history does not change new tasks", async (t) => {
+  const seen = [];
+  const { app } = await officeFixture(t,(body,_req,res)=>{ seen.push(body.model); completion(res,"done"); });
+  let response = await app.request("/v1/chat/completions","POST",{model:"strategy",messages:[{role:"user",content:"审计 Excel 财务计算和复杂公式"}]});
+  assert.equal(response.status,200);
+  assert.equal(app.store.state.runs[0].routeReason,"office-sensitive-escalation");
+  response = await app.request("/v1/chat/completions","POST",{model:"strategy",messages:[{role:"system",content:"Word Excel tools"},{role:"user",content:"编辑 Word 文档"},{role:"assistant",content:"done"},{role:"user",content:"杭州天气"}]});
+  assert.equal(response.status,200);
+  assert.equal(app.store.state.runs[0].routeReason,"simple-task-direct");
+  assert.deepEqual(seen,["openai/gpt-6.1-sol--fast","openai/gpt-6.1-sol--fast"]);
+});
+
+test("Office capacity fallback does not truncate or call an undersized model", async (t) => {
+  const messages=[{role:"user",content:"整理 Excel 工作表。"+" abc".repeat(2000)}];
+  const { app }=await officeFixture(t,(body,_req,res)=>{assert.equal(body.model,"openai/gpt-6.1-sol--fast");assert.deepEqual(body.messages,messages);completion(res,"done");},{contextWindow:4096});
+  const response=await app.request("/v1/chat/completions","POST",{model:"strategy",messages});
+  assert.equal(response.status,200);
+  assert.equal(app.store.state.runs[0].routeReason,"office-no-preferred-escalation");
+});
+
+test("Office explicit upstream failure switches models and preserves messages", async (t) => {
+  const messages=[{role:"user",content:"排版报告.docx"}];const seen=[];
+  const { app }=await officeFixture(t,(body,_req,res)=>{seen.push(body.model);assert.deepEqual(body.messages,messages);if(body.model.startsWith("kimi")){res.writeHead(429);return res.end("quota");}completion(res,"done");});
+  const response=await app.request("/v1/chat/completions","POST",{model:"strategy",messages});
+  assert.equal(response.status,200);
+  assert.deepEqual(seen,["kimi-code/k3.1-pro-highspeed","openai/gpt-6.1-sol--fast"]);
+  assert.equal(app.store.state.runs[0].routeReason,"office-upstream-fallback");
+  assert.equal(app.store.state.runs[0].routeFailures[0].upstreamStatus,429);
+  assert.equal(response.body.usage,null);
+  assert.equal(app.store.state.runs[0].totals.calls,2);
+  assert.deepEqual(app.store.state.runs[0].calls.map(call => call.status), ["failed", "completed"]);
+});
+
+test("Office policy does not retry invalid tool output or ordinary text", async (t) => {
+  let count=0;const {app}=await officeFixture(t,(_body,_req,res)=>{count++;completion(res,"I can help.");});
+  const response=await app.request("/v1/chat/completions","POST",{model:"strategy",messages:[{role:"user",content:"编辑 Excel 表格"}],tools:weatherTools,tool_choice:"required"});
+  assert.equal(response.status,502);
+  assert.equal(count,1);
+});
+
+test("Office preference can be disabled without changing executor roles", async (t) => {
+  const {app}=await officeFixture(t,(body,_req,res)=>{assert.equal(body.model,"openai/gpt-6.1-sol--fast");completion(res,"done");});
+  const config=(await app.request("/api/config")).body;
+  await app.request("/api/strategy","PUT",{...config.strategy,officeRoutingEnabled:false});
+  const response=await app.request("/v1/chat/completions","POST",{model:"strategy",messages:[{role:"user",content:"编辑 Excel"}]});
+  assert.equal(response.status,200);
+  assert.equal(app.store.state.runs[0].routeReason,"simple-task-direct");
+});
+
+test("Office fallback stops after three attempts and records final escalation", async (t) => {
+  const seen=[];
+  const {app,baseUrl}=await officeFixture(t,(body,_req,res)=>{seen.push(body.model);res.writeHead(503);res.end("unavailable");});
+  for(const model of ["kimi-code/k3.1-pro","deepseek/deepseek-v4-flash","openai/gpt-6-luna--fast"]) await app.request("/api/models","POST",{name:model,model,kind:"live",baseUrl});
+  const response=await app.request("/v1/chat/completions","POST",{model:"strategy",messages:[{role:"user",content:"整理 Excel 表格"}]});
+  assert.equal(response.status,502);
+  assert.deepEqual(seen,["kimi-code/k3.1-pro-highspeed","kimi-code/k3.1-pro","openai/gpt-6.1-sol--fast"]);
+  assert.equal(app.store.state.runs[0].calls.length, 3);
+  assert.deepEqual(app.store.state.runs[0].totals, { input: null, output: null, cost: null, calls: 3 });
+});
+
+test("native upstream failure counts a failed attempt without retrying or echoing secrets", async (t) => {
+  const app = await fixture(t);
+  let count = 0;
+  const baseUrl = await provider(t, (_body, _req, res) => {
+    count++;
+    res.writeHead(429);
+    res.end("private-test-key");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const response = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy", messages: [{ role: "user", content: "hello" }],
+  });
+  assert.equal(response.status, 502);
+  assert.equal(count, 1);
+  const run = app.store.state.runs[0];
+  assert.equal(run.calls.length, 1);
+  assert.equal(run.calls[0].role, "executor");
+  assert.equal(run.calls[0].status, "failed");
+  assert.equal(run.calls[0].upstreamStatus, 429);
+  assert.deepEqual(run.totals, { input: null, output: null, cost: null, calls: 1 });
+  assert(!JSON.stringify(run).includes("private-test-key"));
+  const persisted = JSON.parse(await readFile(path.join(app.directory, "state.json"), "utf8"));
+  assert.deepEqual(persisted.runs[0].calls, run.calls);
+});
+
+test("native failed execution preserves the successful planner usage but marks the total unknown", async (t) => {
+  const app = await fixture(t);
+  let count = 0;
+  const baseUrl = await provider(t, (body, _req, res) => {
+    count++;
+    if (body.messages[0].content.includes("路由规划器"))
+      return completion(res, '{"executorIndex":0,"plan":"Use the original task"}');
+    res.writeHead(503);
+    res.end("private-test-key");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const response = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy", messages: [{ role: "user", content: "Analyze the architecture and design a detailed implementation plan with explicit verification requirements." }],
+  });
+  assert.equal(response.status, 502);
+  assert.equal(count, 2);
+  const run = app.store.state.runs[0];
+  assert.deepEqual(run.calls.map(call => [call.role, call.status]), [["planner", "completed"], ["executor", "failed"]]);
+  assert.deepEqual(run.calls[0].usage, { input: 20, output: 10, source: "provider" });
+  assert.equal(run.calls[1].upstreamStatus, 503);
+  assert.deepEqual(run.totals, { input: null, output: null, cost: null, calls: 2 });
+  assert(!JSON.stringify(run).includes("private-test-key"));
+});
+
+test("native failed planner and malformed responses are both counted as attempts", async (t) => {
+  const app = await fixture(t);
+  let count = 0;
+  const baseUrl = await provider(t, (_body, _req, res) => {
+    count++;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end("not JSON private-test-key");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  const response = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy", messages: [{ role: "user", content: "Analyze the architecture and design a detailed implementation plan with explicit verification requirements." }],
+  });
+  assert.equal(response.status, 502);
+  assert.equal(count, 1);
+  const run = app.store.state.runs[0];
+  assert.equal(run.calls[0].role, "planner");
+  assert.equal(run.calls[0].status, "failed");
+  assert.equal(run.calls[0].upstreamStatus, undefined);
+  assert.deepEqual(run.totals, { input: null, output: null, cost: null, calls: 1 });
+  assert(!JSON.stringify(run).includes("private-test-key"));
+});
+
+test("native body timeout is diagnosed and saved without a generic internal error or retry", async t => {
+  const app = await fixture(t);
+  let count = 0;
+  const baseUrl = await provider(t, (_body, _req, res) => {
+    count++;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.flushHeaders();
+    res.write('{"private":"private-test-key",');
+  });
+  await addLive(app, baseUrl, { timeoutMs: 1000 });
+  await noReview(app);
+  const response = await app.request("/v1/chat/completions", "POST", {
+    model: "strategy", messages: [{ role: "user", content: "hello" }],
+  });
+  assert.equal(response.status, 502);
+  assert.match(response.body.error.message, /超时/);
+  assert(!response.body.error.message.includes("内部"));
+  assert.equal(count, 1);
+  const run = app.store.state.runs[0];
+  assert.equal(run.failureKind, "timeout");
+  assert.equal(run.failurePhase, "body");
+  assert.equal(run.calls[0].failureKind, "timeout");
+  assert.equal(run.calls[0].failurePhase, "body");
+  assert.deepEqual(run.totals, { input: null, output: null, cost: null, calls: 1 });
+  const persisted = JSON.parse(await readFile(path.join(app.directory, "state.json"), "utf8"));
+  assert.equal(persisted.runs[0].failureKind, "timeout");
+  assert(!JSON.stringify(run).includes("private-test-key"));
+});
+
+test("enabled Office policy leaves explicit client compaction on the planner", async (t) => {
+  let count=0;const {app}=await officeFixture(t,(body,_req,res)=>{count++;assert.equal(body.model,"openai/gpt-6.1-sol--fast");completion(res,"summary");});
+  const response=await app.request("/v1/chat/completions","POST",{model:"strategy",messages:[{role:"user",content:"编辑 Excel"},{role:"assistant",content:"done"},{role:"user",content:COMPACTION_MARKER}]});
+  assert.equal(response.status,200);
+  assert.equal(app.store.state.runs[0].routeReason,"client-requested-compaction");
+  assert.equal(count,1);
+});
+
+test("all reasoning presets reach native execution with a 32K output budget", async (t) => {
+  const app=await fixture(t);const seen=[];
+  const baseUrl=await provider(t,(body,_req,res)=>{seen.push(body);completion(res,"ok");});
+  await addLive(app,baseUrl,{maxTokens:32768,reasoningEfforts:["none","minimal","low","medium","high","xhigh","max"]});
+  await noReview(app);
+  for(const effort of ["none","minimal","low","medium","high","xhigh","max","ultra"]){
+    const response=await app.request("/v1/chat/completions","POST",{model:"strategy",messages:[{role:"user",content:"hello"}],reasoning_effort:effort,max_completion_tokens:32768});
+    assert.equal(response.status,200);
+    assert.equal(seen.at(-1).reasoning_effort,effort==="ultra"?"max":effort);
+    assert.equal(seen.at(-1).max_tokens,32768);
+    assert.equal(app.store.state.runs[0].calls[0].requestedReasoningEffort,effort);
+  }
+  const bad=await app.request("/v1/chat/completions","POST",{model:"strategy",messages:[{role:"user",content:"hello"}],reasoning_effort:"typo"});
+  assert.equal(bad.status,400);
+});
+
+test("requested effort is adapted on planner, executor and reviewer without a hidden 4096 cap", async (t) => {
+  const app=await fixture(t);let count=0;
+  const baseUrl=await provider(t,(body,_req,res)=>{count++;assert.equal(body.reasoning_effort,"high");assert.equal(body.max_tokens,32768);completion(res,count===1?'{"executorIndex":0}':"done");});
+  await addLive(app,baseUrl,{maxTokens:32768,reasoningEfforts:["low","high","max"]});
+  const result=await app.request("/v1/chat/completions","POST",{model:"strategy",reasoning_effort:"xhigh",messages:[{role:"user",content:"Design a complete migration plan for a complicated distributed system with multiple components."}]});
+  assert.equal(result.status,200);
+  assert.deepEqual(app.store.state.runs[0].calls.map(c=>c.role),["planner","executor","reviewer"]);
+  assert(app.store.state.runs[0].calls.every(c=>c.requestedReasoningEffort==="xhigh"&&c.effectiveReasoningEffort==="high"));
 });

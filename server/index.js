@@ -79,6 +79,12 @@ export async function createApplication({
           protocol: "native-agent-v1",
           functionTools: true,
           compaction: "client-requested-only",
+          officeRouting: "task-preference-v1",
+          reasoningRouting: "per-model-v1",
+          callAccounting: "attempt-aware-v1",
+          failureDiagnostics: "phase-aware-v1",
+          toolProtocolValidation: "guarded-v1",
+          decisionRouting: "supervised-v1",
         });
       if (route === "/api/config" && method === "GET")
         return send(response, 200, store.publicConfig());

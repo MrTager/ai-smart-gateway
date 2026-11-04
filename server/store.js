@@ -7,6 +7,7 @@ import {
 } from "node:crypto";
 import path from "node:path";
 import { LIMITS } from "./limits.js";
+import { DEFAULT_REVIEW_INTERVAL } from "./decision-routing.js";
 
 export const initialState = () => ({
   models: [
@@ -61,6 +62,9 @@ export const initialState = () => ({
     maxSteps: 4,
     concurrency: 2,
     review: false,
+    officeRoutingEnabled: false,
+    decisionMode: "supervised",
+    decisionReviewInterval: DEFAULT_REVIEW_INTERVAL,
     plannerPrompt: "制定简洁、可验证的计划。只传递与当前子任务相关的上下文。",
   },
   runs: [],
@@ -92,6 +96,10 @@ export class Store {
       if (error.code !== "ENOENT") throw error;
       this.state = initialState();
     }
+    this.state.strategy = {
+      decisionMode: "supervised", decisionReviewInterval: DEFAULT_REVIEW_INTERVAL,
+      ...this.state.strategy,
+    };
     for (const run of this.state.runs) {
       if (["queued", "running"].includes(run.status)) {
         run.status = "failed";
