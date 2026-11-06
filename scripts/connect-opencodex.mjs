@@ -235,8 +235,8 @@ export async function connect({ refreshCapabilities = false } = {}) {
       executorIds: executors.map((model) => model.id),
       reviewerId: planner.id,
       review: false,
-      maxSteps: 4,
-      concurrency: 2,
+      maxSteps: 0,
+      concurrency: 0,
     });
   }
   if (!existing) {

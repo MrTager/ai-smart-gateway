@@ -7,7 +7,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { createApplication } from "../server/index.js";
 import { Store } from "../server/store.js";
-import { parsePlan, validateStrategy } from "../server/strategy.js";
+import { demoPlan, parsePlan, validateStrategy } from "../server/strategy.js";
 import { validateModel } from "../server/provider.js";
 import { LIMITS } from "../server/limits.js";
 import { COMPACTION_MARKER } from "../server/native-chat.js";
@@ -1306,3 +1306,189 @@ test("requested effort is adapted on planner, executor and reviewer without a hi
   assert.deepEqual(app.store.state.runs[0].calls.map(c=>c.role),["planner","executor","reviewer"]);
   assert(app.store.state.runs[0].calls.every(c=>c.requestedReasoningEffort==="xhigh"&&c.effectiveReasoningEffort==="high"));
 });
+
+async function heldConcurrencyFixture(t) {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const app = await fixture(t);
+  let arrivals = 0;
+  const baseUrl = await provider(t, async (body, _req, res) => {
+    arrivals++;
+    await gate;
+    if (body.messages[0]?.content.includes("任务规划器")) {
+      return completion(res, JSON.stringify({ summary: "concurrency probe", steps: [
+        { title: "one step", instruction: "Return OK", executorIndex: 0, dependsOn: [] },
+      ] }));
+    }
+    completion(res, "OK");
+  });
+  await addLive(app, baseUrl);
+  await noReview(app);
+  return { app, release, arrivals: () => arrivals };
+}
+
+async function waitForConcurrentArrivals(f, expected, failures) {
+  const deadline = Date.now() + 15000;
+  while (f.arrivals() < expected && !failures.length && Date.now() < deadline)
+    await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(failures, [], "Concurrent requests must not be rejected by a local admission cap");
+  assert.equal(f.arrivals(), expected, "All requests must enter upstream before any response is released");
+}
+
+test("64 native requests execute concurrently without a gateway admission cap", async t => {
+  const f = await heldConcurrencyFixture(t);
+  const count = 64;
+  const failures = [];
+  const requests = Array.from({ length: count }, () => f.app.request("/v1/chat/completions", "POST", {
+    model: "strategy", messages: [{ role: "user", content: "hello" }],
+  }).then(result => {
+    if (result.status !== 200) failures.push(result.status);
+    return result;
+  }));
+  try {
+    await waitForConcurrentArrivals(f, count, failures);
+    assert.equal(f.app.engine.active.size, count);
+    const health = (await f.app.request("/api/health")).body;
+    assert.equal(health.maxConcurrentRequests, null);
+    assert.equal(health.activeRequests, count);
+    assert.equal((await f.app.request("/api/config")).body.limits.maxConcurrentRequests, null);
+  } finally {
+    f.release();
+    const results = await Promise.all(requests);
+    assert(results.every(result => result.status === 200));
+  }
+  assert.equal(f.app.engine.active.size, 0);
+  assert.equal(f.app.store.state.runs.filter(run => run.status === "completed").length, count);
+});
+
+test("workbench and native requests share tracking without limiting each other's admission", async t => {
+  const f = await heldConcurrencyFixture(t);
+  const failures = [];
+  const workbench = Array.from({ length: 8 }, (_, index) => f.app.request("/api/runs", "POST", {
+    task: "concurrent workbench " + index, demo: false,
+  }).then(result => {
+    if (result.status !== 202) failures.push(result.status);
+    return result;
+  }));
+  const native = Array.from({ length: 8 }, () => f.app.request("/v1/chat/completions", "POST", {
+    model: "strategy", messages: [{ role: "user", content: "hello" }],
+  }).then(result => {
+    if (result.status !== 200) failures.push(result.status);
+    return result;
+  }));
+  try {
+    await waitForConcurrentArrivals(f, 16, failures);
+    assert.equal(f.app.engine.active.size, 16);
+    assert.equal(f.app.nativeEngine.active, f.app.engine.active);
+    assert.equal((await f.app.request("/api/health")).body.activeRequests, 16);
+  } finally {
+    f.release();
+    const [submitted, results] = await Promise.all([Promise.all(workbench), Promise.all(native)]);
+    assert(submitted.every(result => result.status === 202));
+    assert(results.every(result => result.status === 200));
+    await Promise.all([...f.app.engine.active.values()]);
+  }
+  assert.equal(f.app.engine.active.size, 0);
+  assert.equal(f.app.store.state.runs.filter(run => run.status === "completed").length, 16);
+});
+
+test("strategy saves large explicit limits and zero as unlimited without retaining the old 8/4 caps", async t => {
+  const app = await fixture(t);
+  const base = (await app.request("/api/config")).body.strategy;
+  assert.equal(base.maxSteps, 0);
+  assert.equal(base.concurrency, 0);
+  for (const values of [{ maxSteps: 64, concurrency: 32 }, { maxSteps: 0, concurrency: 0 }]) {
+    const saved = await app.request("/api/strategy", "PUT", { ...base, ...values });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.strategy.maxSteps, values.maxSteps);
+    assert.equal(saved.body.strategy.concurrency, values.concurrency);
+    const persisted = await new Store(app.directory).init();
+    assert.equal(persisted.state.strategy.maxSteps, values.maxSteps);
+    assert.equal(persisted.state.strategy.concurrency, values.concurrency);
+  }
+  for (const bad of [
+    { maxSteps: -1 }, { concurrency: -1 }, { maxSteps: 1.5 }, { concurrency: 0.5 },
+    { maxSteps: null }, { concurrency: "" }, { maxSteps: true }, { concurrency: [] },
+    { maxSteps: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    assert.equal((await app.request("/api/strategy", "PUT", { ...base, ...bad })).status, 400);
+  }
+  assert.equal((await app.request("/api/config")).body.strategy.maxSteps, 0);
+});
+
+test("zero plan limit preserves nonempty plans and dependencies and keeps demo steps", () => {
+  const steps = Array.from({ length: 65 }, (_, i) => ({
+    title: "step " + i, instruction: "instruction " + i, dependsOn: i ? ["step-" + i] : [],
+  }));
+  assert.equal(parsePlan(JSON.stringify({ steps }), 0).steps.length, 65);
+  assert.throws(() => parsePlan(JSON.stringify({ steps }), 64), /步骤数量/);
+  assert.throws(() => parsePlan('{"steps":[]}', 0), /步骤数量/);
+  assert.throws(() => parsePlan('null', 0), /步骤数量/);
+  assert.throws(() => parsePlan('{"steps":[{"title":"a","instruction":"b","dependsOn":["step-2"]}]}', 0), /依赖/);
+  assert.equal(demoPlan("demo", 0).steps.length, 3);
+  assert.equal(parsePlan(JSON.stringify(demoPlan("demo", 0)), 0).steps.length, 3);
+});
+
+for (const concurrency of [0, 12]) {
+  test(`workbench schedules 65 steps with concurrency ${concurrency} and respects join dependencies`, async t => {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const app = await fixture(t);
+    const count = 64;
+    let started = 0, finished = 0, active = 0, peak = 0;
+    const steps = Array.from({ length: count }, (_, index) => ({
+      title: "leaf " + index, instruction: "leaf " + index, executorIndex: 0, dependsOn: [],
+    }));
+    steps.push({ title: "join", instruction: "join", executorIndex: 0,
+      dependsOn: Array.from({ length: count }, (_, index) => "step-" + (index + 1)) });
+    const baseUrl = await provider(t, async (body, _req, res) => {
+      if (body.messages[0].content.includes("任务规划器")) {
+        assert.match(body.messages[0].content, concurrency === 0 ? /子任务数量不设固定上限/ : /最多 65 步/);
+        return completion(res, JSON.stringify({ steps }));
+      }
+      const payload = JSON.parse(body.messages.at(-1).content);
+      if (payload.instruction === "join") {
+        assert.equal(finished, count);
+        assert.equal(payload.dependencies.length, count);
+        return completion(res, "joined");
+      }
+      started++;
+      active++;
+      peak = Math.max(peak, active);
+      await gate;
+      finished++;
+      active--;
+      completion(res, "OK");
+    });
+    await addLive(app, baseUrl, { maxTokens: 32768 });
+    await noReview(app);
+    assert.equal((await app.request("/api/strategy", "PUT", {
+      ...app.store.state.strategy, maxSteps: concurrency === 0 ? 0 : 65, concurrency,
+    })).status, 200);
+    const submitted = await app.request("/api/runs", "POST", { task: "parallel steps probe", demo: false });
+    assert.equal(submitted.status, 202);
+    const run = app.store.state.runs.find(row => row.id === submitted.body.id);
+    const job = app.engine.active.get(run.id);
+    const firstWave = concurrency || count;
+    try {
+      const deadline = Date.now() + 15000;
+      while (started < firstWave && run.status !== "failed" && Date.now() < deadline)
+        await new Promise(resolve => setTimeout(resolve, 10));
+      assert.notEqual(run.status, "failed", run.error);
+      assert.equal(started, firstWave);
+      assert.equal(peak, firstWave);
+    } finally {
+      release();
+      await job;
+    }
+    assert.equal(run.status, "completed", run.error);
+    assert.equal(run.steps.length, 65);
+    assert.equal(run.steps.filter(step => step.status === "completed").length, 65);
+    assert.equal(peak, firstWave);
+    assert.equal(run.calls.length, 66);
+    assert.match(run.result, /joined/);
+    assert.equal(app.engine.active.size, 0);
+  });
+}

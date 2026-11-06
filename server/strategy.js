@@ -25,17 +25,17 @@ export function validateStrategy(body, models) {
     throw new AppError("请选择 1–8 个执行模型。");
   if (body.review && !ids.has(body.reviewerId))
     throw new AppError("启用复核时请选择复核模型。");
-  const maxSteps = Number(body.maxSteps);
-  const concurrency = Number(body.concurrency);
+  const count = value => typeof value === "number" || (typeof value === "string" && value.trim())
+    ? Number(value) : NaN;
+  const maxSteps = count(body.maxSteps);
+  const concurrency = count(body.concurrency);
   if (
-    !Number.isInteger(maxSteps) ||
-    maxSteps < 1 ||
-    maxSteps > 8 ||
-    !Number.isInteger(concurrency) ||
-    concurrency < 1 ||
-    concurrency > 4
+    !Number.isSafeInteger(maxSteps) ||
+    maxSteps < 0 ||
+    !Number.isSafeInteger(concurrency) ||
+    concurrency < 0
   )
-    throw new AppError("子任务上限为 1–8，并发度为 1–4。");
+    throw new AppError("最多子任务和并行执行数必须为有效的非负整数；0 表示不限。");
   return {
     mode: "strategy",
     plannerId: body.plannerId,
@@ -67,9 +67,9 @@ export function parsePlan(content, maximum) {
     );
   }
   if (
-    !Array.isArray(value.steps) ||
+    !Array.isArray(value?.steps) ||
     !value.steps.length ||
-    value.steps.length > maximum
+    (maximum > 0 && value.steps.length > maximum)
   )
     throw new AppError("决策模型计划的步骤数量无效。", 502);
   const seen = new Set();
@@ -127,7 +127,7 @@ export function demoPlan(task, maximum) {
       instruction: "核对方案完整性，列出关键风险及下一步。",
       dependsOn: ["step-2"],
     },
-  ].slice(0, maximum);
+  ].slice(0, maximum || undefined);
   return {
     summary: "演示计划：目标拆解 → 方案执行 → 风险检查（未调用真实模型）",
     steps: steps.map((step, i) => ({
@@ -154,8 +154,6 @@ export class Engine {
         "任务不能为空，且需小于 8,000,000 个 UTF-16 单元和 16 MiB UTF-8 文本。实际 token 容量由上游模型校验。",
         413,
       );
-    if (this.active.size >= 4)
-      throw new AppError("最多同时运行 4 个任务，请稍后重试。", 429);
     // Never clone large task histories into each model call's configuration snapshot.
     const config = structuredClone({
       models: this.store.state.models,
@@ -265,7 +263,7 @@ export class Engine {
       const plannerMessages = [
         {
           role: "system",
-          content: `你是任务规划器，不直接完成任务。仅输出 JSON，不要输出思维链。格式：${JSON.stringify(schema)}。最多 ${strategy.maxSteps} 步。步骤自动按顺序命名 step-1、step-2 等。dependsOn 只能引用先前步骤的 ID，无依赖可并行。executorIndex 是执行模型下标（0 到 ${strategy.executorIds.length - 1}），按能力选择：${strategy.executorIds.map((id, i) => `${i}: ${modelById(id).name}`).join("；")}。把必要的原始上下文包含在对应步骤指令中，执行模型只收到该指令和直接依赖结果。指令必须保留原始任务意图及可验证要求。${strategy.plannerPrompt}`,
+          content: `你是任务规划器，不直接完成任务。仅输出 JSON，不要输出思维链。格式：${JSON.stringify(schema)}。${strategy.maxSteps === 0 ? "子任务数量不设固定上限，按任务需要生成必要的有限步骤，避免无意义拆分。" : `最多 ${strategy.maxSteps} 步。`}步骤自动按顺序命名 step-1、step-2 等。dependsOn 只能引用先前步骤的 ID，无依赖可并行。executorIndex 是执行模型下标（0 到 ${strategy.executorIds.length - 1}），按能力选择：${strategy.executorIds.map((id, i) => `${i}: ${modelById(id).name}`).join("；")}。把必要的原始上下文包含在对应步骤指令中，执行模型只收到该指令和直接依赖结果。指令必须保留原始任务意图及可验证要求。${strategy.plannerPrompt}`,
         },
         { role: "user", content: run.task },
       ];
@@ -342,7 +340,7 @@ export class Engine {
                   run.steps.find((s) => s.id === id)?.status === "completed",
               ),
           )
-          .slice(0, strategy.concurrency);
+          .slice(0, strategy.concurrency || undefined);
         if (!ready.length)
           throw new AppError("执行计划存在无法满足的依赖。", 502);
         // Settle all siblings before failing, so traces cannot mutate after completion.

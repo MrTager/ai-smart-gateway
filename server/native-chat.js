@@ -252,8 +252,6 @@ export class NativeChatEngine {
     this.active = active;
   }
   create(body, signal) {
-    if (this.active.size >= 4)
-      throw new AppError("最多同时运行 4 个任务，请稍后重试。", 429);
     const config = structuredClone({
       models: this.store.state.models,
       strategy: this.store.state.strategy,

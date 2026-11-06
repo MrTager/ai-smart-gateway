@@ -75,6 +75,8 @@ export async function createApplication({
       if (route === "/api/health" && method === "GET")
         return send(response, 200, {
           status: "ok",
+          maxConcurrentRequests: LIMITS.maxConcurrentRequests,
+          activeRequests: engine.active.size,
           localOnly: true,
           protocol: "native-agent-v1",
           functionTools: true,
